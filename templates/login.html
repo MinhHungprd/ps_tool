@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8">
+  <title>Đăng nhập – Auto PSD</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;500;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/login.css') }}">
+</head>
+<body>
+  <section>
+    <!-- leaves -->
+    <div class="leaves">
+      <div class="set">
+        <div><img src="{{ url_for('static', filename='img/leaf_01.png') }}" alt=""></div>
+        <div><img src="{{ url_for('static', filename='img/leaf_02.png') }}" alt=""></div>
+        <div><img src="{{ url_for('static', filename='img/leaf_03.png') }}" alt=""></div>
+        <div><img src="{{ url_for('static', filename='img/leaf_04.png') }}" alt=""></div>
+        <div><img src="{{ url_for('static', filename='img/leaf_01.png') }}" alt=""></div>
+        <div><img src="{{ url_for('static', filename='img/leaf_02.png') }}" alt=""></div>
+        <div><img src="{{ url_for('static', filename='img/leaf_03.png') }}" alt=""></div>
+        <div><img src="{{ url_for('static', filename='img/leaf_04.png') }}" alt=""></div>
+      </div>
+    </div>
+
+    <!-- background layers -->
+    <img src="{{ url_for('static', filename='img/bg.jpg') }}" class="bg" alt="">
+    <img src="{{ url_for('static', filename='img/girl.png') }}" class="girl" alt="">
+    <img src="{{ url_for('static', filename='img/trees.png') }}" class="trees" alt="">
+
+    <!-- glass login -->
+    <form class="login" method="POST">
+      <h2>Sign In</h2>
+      {% with messages = get_flashed_messages(with_categories=true) %}
+        {% if messages %}
+          {% for cat, msg in messages %}
+            <div class="alert alert-{{cat}}">{{ msg }}</div>
+          {% endfor %}
+        {% endif %}
+      {% endwith %}
+
+      <div class="inputBox">
+        <input type="text" name="username" placeholder="Username" required>
+      </div>
+      <div class="inputBox">
+        <input type="password" name="password" placeholder="Password" required>
+      </div>
+      <div class="inputBox">
+        <input type="submit" value="Login" id="btn">
+      </div>
+      <div class="group">
+        <a href="#" tabindex="-1">Forget Password</a>
+        <a href="#" tabindex="-1">Signup</a>
+      </div>
+    </form>
+  </section>
+</body>
+</html>
