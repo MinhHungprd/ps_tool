@@ -1,38 +1,89 @@
-# ps_relink_and_export.py — Run JSX via Photoshop "-r"
-import json, argparse, os, time, subprocess, sys
+# ps_relink_and_export.py
+import argparse, os, time, tempfile, subprocess, sys
 from pathlib import Path
 
-HERE = Path(__file__).resolve().parent
-CFG_PATH = HERE / "ps_tool_config.json"
-JSX_PATH = HERE / "process_mockup.jsx"
+JSX_TEMPLATE = r"""#target photoshop
+app.displayDialogs = DialogModes.NO;
 
-DEFAULT_CANDIDATES = [
+// === Đường dẫn tự động điền từ Python ===
+var psdPath = "{psd}";
+var imgPath = "{img}";
+var outPath = "{out}";
+
+// ===== Helpers =====
+function replaceSmartObjectContents(newFile) {{
+    var idplacedLayerReplaceContents = stringIDToTypeID("placedLayerReplaceContents");
+    var desc = new ActionDescriptor();
+    desc.putPath(charIDToTypeID("null"), new File(newFile));
+    executeAction(idplacedLayerReplaceContents, desc, DialogModes.NO);
+}}
+function isSmartObjectLayer(ly) {{
+    try {{ return ly.kind == LayerKind.SMARTOBJECT; }} catch (e) {{ return false; }}
+}}
+function walkAndRelinkFirstSO(container, newFile) {{
+    for (var i = 0; i < container.layers.length; i++) {{
+        var ly = container.layers[i];
+        if (ly.typename === "LayerSet") {{
+            var ok = walkAndRelinkFirstSO(ly, newFile);
+            if (ok) return true;
+        }} else {{
+            if (isSmartObjectLayer(ly)) {{
+                app.activeDocument.activeLayer = ly;
+                replaceSmartObjectContents(newFile);
+                return true;
+            }}
+        }}
+    }}
+    return false;
+}}
+function saveAsJPEG(doc, outPath) {{
+    var f = new File(outPath);
+    var opt = new JPEGSaveOptions();
+    opt.quality = 12; // 0..12
+    opt.embedColorProfile = true;
+    opt.matte = MatteType.NONE;
+    doc.saveAs(f, opt, true);
+}}
+
+// ===== MAIN =====
+var psdFile = new File(psdPath);
+if (!psdFile.exists) {{ alert("PSD not found: " + psdPath); }}
+else {{
+    var doc = app.open(psdFile);
+    // Relink Smart Object đầu tiên
+    var ok = walkAndRelinkFirstSO(doc, imgPath);
+    if (!ok) {{ alert("Không tìm thấy Smart Object để relink."); }}
+
+    // Flatten và export
+    var dup = doc.duplicate();
+    dup.flatten();
+    saveAsJPEG(dup, outPath);
+
+    dup.close(SaveOptions.DONOTSAVECHANGES);
+    doc.close(SaveOptions.DONOTSAVECHANGES);
+}}
+"""
+
+DEFAULT_PS_EXE = [
     r"C:\Program Files\Adobe\Adobe Photoshop 2025\Photoshop.exe",
     r"C:\Program Files\Adobe\Adobe Photoshop 2024\Photoshop.exe",
     r"C:\Program Files\Adobe\Adobe Photoshop 2023\Photoshop.exe",
     r"C:\Program Files\Adobe\Adobe Photoshop\Photoshop.exe",
 ]
 
-def find_photoshop_exe(candidates):
-    for p in candidates:
+def find_photoshop_exe(user_path: str | None) -> str:
+    if user_path and os.path.isfile(user_path):
+        return user_path
+    for p in DEFAULT_PS_EXE:
         if os.path.isfile(p):
             return p
-    # thử tìm qua PATH (nếu người dùng đã add)
     from shutil import which
-    p = which("Photoshop.exe")
-    return p
+    w = which("Photoshop.exe")
+    if w:
+        return w
+    raise FileNotFoundError("Không tìm thấy Photoshop.exe. Truyền --ps-exe với đường dẫn đầy đủ.")
 
-def run_photoshop_with_jsx(photoshop_exe, jsx_path):
-    # quotes bắt buộc nếu có dấu cách
-    cmd = [photoshop_exe, "-r", str(jsx_path)]
-    try:
-        subprocess.Popen(cmd, close_fds=True)
-        return True
-    except Exception as e:
-        print("[ERR] Launch Photoshop failed:", e)
-        return False
-
-def wait_for_file(path, timeout=240):
+def wait_for(path: str, timeout=120):
     t0 = time.time()
     while time.time() - t0 < timeout:
         if os.path.isfile(path):
@@ -41,47 +92,46 @@ def wait_for_file(path, timeout=240):
     return False
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--ps-exe", dest="ps_exe", default=None,
-                    help='Đường dẫn Photoshop.exe (vd: "C:\\Program Files\\Adobe\\Adobe Photoshop 2024\\Photoshop.exe")')
-    ap.add_argument("--psd", required=True)
-    ap.add_argument("--img", required=True)
-    ap.add_argument("--out", required=True)
-    ap.add_argument("--design-layer", dest="design_layer", default=None)
-    ap.add_argument("--text-layer", dest="text_layer", default=None)
-    ap.add_argument("--text", dest="text_content", default=None)
-    ap.add_argument("--fmt", default="jpg", choices=["jpg","png"])
+    ap = argparse.ArgumentParser(description="Relink SmartObject đầu tiên và export JPG (1 ảnh).")
+    ap.add_argument("--ps-exe", required=False, help="Đường dẫn Photoshop.exe (vd: D:\\DATA\\Adobe\\Adobe Photoshop 2022\\Photoshop.exe)")
+    ap.add_argument("--psd", required=True, help="Đường dẫn PSD template")
+    ap.add_argument("--img", required=True, help="Đường dẫn ảnh đầu vào")
+    ap.add_argument("--out", required=True, help="Đường dẫn file JPG đầu ra")
     args = ap.parse_args()
 
-    cfg = {
-        "psd": os.path.abspath(args.psd).replace("\\", "/"),
-        "image": os.path.abspath(args.img).replace("\\", "/"),
-        "output": os.path.abspath(args.out).replace("\\", "/"),
-        "designLayerName": args.design_layer,
-        "textLayerName": args.text_layer,
-        "textContent": args.text_content,
-        "format": args.fmt.lower()
-    }
-    os.makedirs(os.path.dirname(cfg["output"]), exist_ok=True)
-    with open(CFG_PATH, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, ensure_ascii=False, indent=2)
+    ps_exe = find_photoshop_exe(args.ps_exe)
 
-    # xác định photoshop.exe
-    photoshop_exe = args.ps_exe or find_photoshop_exe(DEFAULT_CANDIDATES)
-    if not photoshop_exe or not os.path.isfile(photoshop_exe):
-        raise FileNotFoundError(
-            "Không tìm thấy Photoshop.exe. Truyền tham số --ps-exe với đường dẫn đầy đủ.\n"
-            "Ví dụ: --ps-exe \"C:\\Program Files\\Adobe\\Adobe Photoshop 2024\\Photoshop.exe\""
-        )
+    psd = os.path.abspath(args.psd).replace("\\", "/")
+    img = os.path.abspath(args.img).replace("\\", "/")
+    outp = os.path.abspath(args.out).replace("\\", "/")
 
-    if not run_photoshop_with_jsx(photoshop_exe, JSX_PATH):
+    os.makedirs(os.path.dirname(outp), exist_ok=True)
+
+    # Tạo JSX tạm với đường dẫn đã nhúng
+    jsx_code = JSX_TEMPLATE.format(psd=psd, img=img, out=outp)
+    with tempfile.NamedTemporaryFile(prefix="ps_relink_", suffix=".jsx", delete=False) as tf:
+        jsx_path = tf.name
+    Path(jsx_path).write_text(jsx_code, encoding="utf-8")
+
+    # Chạy Photoshop -r JSX
+    cmd = [ps_exe, "-r", jsx_path]
+    try:
+        subprocess.Popen(cmd, close_fds=True)
+    except Exception as e:
+        print("[ERR] Launch Photoshop failed:", e)
         sys.exit(1)
 
-    if not wait_for_file(cfg["output"], timeout=240):
-        raise RuntimeError("Export failed, not found: " + cfg["output"])
+    # Chờ file output
+    if not wait_for(outp, timeout=240):
+        print("[ERR] Không thấy file output:", outp)
+        sys.exit(2)
 
-    print("OK:", cfg["output"])
+    print("OK:", outp)
+    # Dọn file JSX tạm (giữ lại nếu bạn muốn debug)
+    try:
+        os.remove(jsx_path)
+    except Exception:
+        pass
 
 if __name__ == "__main__":
-    import time
     main()

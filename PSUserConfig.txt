@@ -1,0 +1,2 @@
+# C:\Users\DELL\AppData\Roaming\Adobe\Adobe Photoshop 2022\Adobe Photoshop 2022 Settings
+WarnRunningScripts 0
