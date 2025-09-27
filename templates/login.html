@@ -6,6 +6,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;500;600&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="{{ url_for('static', filename='css/login.css') }}">
+
+  <!-- Mini toast style (nhẹ, không phụ thuộc lib nào) -->
 </head>
 <body>
   <section>
@@ -49,10 +51,36 @@
         <input type="submit" value="Login" id="btn">
       </div>
       <div class="group">
-        <a href="#" tabindex="-1">Forget Password</a>
-        <a href="#" tabindex="-1">Signup</a>
+        <a href="#" id="forgot-link" tabindex="-1">Forget Password</a>
+        <a href="#" id="signup-link" tabindex="-1">Signup</a>
       </div>
     </form>
   </section>
+
+  <!-- Mini toast container -->
+  <div id="toast" class="mini-toast" role="status" aria-live="polite"></div>
+
+  <script>
+    // Hiển thị thông báo nổi 2.5 giây
+    function showToast(message){
+      const el = document.getElementById('toast');
+      el.textContent = message;
+      el.classList.add('show');
+      clearTimeout(showToast._t);
+      showToast._t = setTimeout(()=>el.classList.remove('show'), 2500);
+    }
+
+    // Signup: báo liên hệ admin
+    document.getElementById('signup-link').addEventListener('click', function(e){
+      e.preventDefault();
+      showToast('Vui lòng liên hệ admin để được cấp tài khoản.');
+    });
+
+    // Forgot password: cũng báo liên hệ admin (nếu muốn)
+    document.getElementById('forgot-link').addEventListener('click', function(e){
+      e.preventDefault();
+      showToast('Vui lòng liên hệ admin để đặt lại mật khẩu.');
+    });
+  </script>
 </body>
 </html>

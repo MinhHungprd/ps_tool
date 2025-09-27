@@ -223,11 +223,11 @@ function renderList(list){
           const fname = e.filename || `${it.type}_${e.size}.psd`;
           const sJson = JSON.stringify(e.size);
           return `
-            <li class="list-group-item d-flex justify-content-between align-items-center flex-wrap">
-              <div class="me-2">
+            <li class="list-group-item d-flex justify-content-between align-items-center">
+              <div class="flex-grow-1 me-3">
                 <span class="badge bg-primary me-2">${e.size}</span><code>${fname}</code>
               </div>
-              <div class="d-flex gap-2">
+              <div class="btn-group" role="group">
                 <button class="btn btn-sm btn-outline-secondary" onclick='return renameSize(${tJson}, ${sJson})'>Sửa tên size</button>
                 <button class="btn btn-sm btn-outline-danger" onclick='return deleteSize(${tJson}, ${sJson})'>Xóa</button>
               </div>
@@ -238,8 +238,8 @@ function renderList(list){
     return `
       <div class="mb-3 border rounded-3 overflow-hidden">
         <div class="d-flex justify-content-between align-items-center p-2 bg-light">
-          <h6 class="m-0">Loại: <code>${it.type}</code></h6>
-          <div class="d-flex gap-2">
+          <h6 class="m-0 flex-grow-1">Loại: <code>${it.type}</code></h6>
+          <div class="btn-group" role="group">
             <button class="btn btn-sm btn-outline-secondary" onclick='return renameType(${tJson})'>Sửa tên loại</button>
             <button class="btn btn-sm btn-outline-danger" onclick='return deleteType(${tJson})'>Xóa cả loại</button>
           </div>

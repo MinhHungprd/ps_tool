@@ -1,7 +1,5 @@
-import os
-import time
-import tempfile
-import subprocess
+# app/services/psd_handler.py
+import os, time, tempfile, subprocess
 from pathlib import Path
 from typing import Optional, List, Dict
 
@@ -10,7 +8,6 @@ app.displayDialogs = DialogModes.NO;
 var psdPath = "{psd}";
 var imgPath = "{img}";
 var outPath = "{out}";
-
 function replaceSmartObjectContents(newFile) {{
     var idplacedLayerReplaceContents = stringIDToTypeID("placedLayerReplaceContents");
     var desc = new ActionDescriptor();
@@ -22,7 +19,10 @@ function walkAndRelinkFirstSO(container, newFile) {{
     for (var i=0;i<container.layers.length;i++) {{
         var ly = container.layers[i];
         if (ly.typename === "LayerSet") {{ var ok = walkAndRelinkFirstSO(ly,newFile); if (ok) return true; }}
-        else {{ if (isSmartObjectLayer(ly)) {{ app.activeDocument.activeLayer = ly; replaceSmartObjectContents(newFile); return true; }} }}
+        else {{ if (isSmartObjectLayer(ly)) {{ app.activeDocument.activeLayer = ly; 
+            var idplacedLayerReplaceContents = stringIDToTypeID("placedLayerReplaceContents");
+            var desc = new ActionDescriptor(); desc.putPath(charIDToTypeID("null"), new File(newFile));
+            executeAction(idplacedLayerReplaceContents, desc, DialogModes.NO); return true; }} }}
     }}
     return false;
 }}
@@ -31,7 +31,6 @@ function saveAsJPEG(doc, outPath) {{
     var opt = new JPEGSaveOptions(); opt.quality = 12; opt.embedColorProfile = true; opt.matte = MatteType.NONE;
     doc.saveAs(f, opt, true);
 }}
-
 var psdFile = new File(psdPath);
 if (!psdFile.exists) {{ throw new Error("PSD not found: " + psdPath); }}
 var doc = app.open(psdFile);
@@ -42,19 +41,16 @@ dup.close(SaveOptions.DONOTSAVECHANGES); doc.close(SaveOptions.DONOTSAVECHANGES)
 """
 
 DEFAULT_PS_EXE = [
-    r"D:\DATA\Adobe\Adobe Photoshop 2022\Photoshop.exe"
+    r"D:\Adobe Photoshop 2022 v23.0.0.36 (x64) Multilingual\Adobe Photoshop 2022\Photoshop.exe",
 ]
 
-def _find_photoshop_exe(user_path: Optional[str]) -> str:
-    if user_path and os.path.isfile(user_path):
-        return user_path
+def _find_photoshop_exe(user_path: Optional[str]) -> Optional[str]:
+    if user_path and os.path.isfile(user_path): return user_path
     for p in DEFAULT_PS_EXE:
-        if os.path.isfile(p):
-            return p
+        if os.path.isfile(p): return p
     from shutil import which
     w = which("Photoshop.exe")
-    if w: return w
-    raise FileNotFoundError("Không tìm thấy Photoshop.exe. Truyền ps_exe đầy đủ.")
+    return w if w and os.path.isfile(w) else None
 
 def _wait_for(path: str, timeout: int = 240) -> bool:
     t0 = time.time()
@@ -63,9 +59,7 @@ def _wait_for(path: str, timeout: int = 240) -> bool:
         time.sleep(0.5)
     return False
 
-def _relink_and_export_single(psd_path: str, img_path: str, out_path: str,
-                              ps_exe: Optional[str] = None, timeout: int = 240) -> bool:
-    ps_exe_resolved = _find_photoshop_exe(ps_exe)
+def _relink_and_export_single(ps_exe: str, psd_path: str, img_path: str, out_path: str, timeout: int = 240) -> bool:
     psd_abs = os.path.abspath(psd_path).replace("\\", "/")
     img_abs = os.path.abspath(img_path).replace("\\", "/")
     out_abs = os.path.abspath(out_path).replace("\\", "/")
@@ -77,7 +71,7 @@ def _relink_and_export_single(psd_path: str, img_path: str, out_path: str,
     Path(jsx_path).write_text(jsx_code, encoding="utf-8")
 
     try:
-        subprocess.Popen([ps_exe_resolved, "-r", jsx_path], close_fds=True)
+        subprocess.Popen([ps_exe, "-r", jsx_path], close_fds=True)
     except Exception as e:
         raise RuntimeError(f"Launch Photoshop failed: {e}")
 
@@ -88,51 +82,50 @@ def _relink_and_export_single(psd_path: str, img_path: str, out_path: str,
 
     return ok
 
-def relink_and_export_single(psd_path: str, img_path: str, out_path: str,
-                             ps_exe: Optional[str] = None, timeout: int = 240) -> bool:
-    """API đơn lẻ—gọi trực tiếp cho 1 dòng."""
-    return _relink_and_export_single(psd_path, img_path, out_path, ps_exe=ps_exe, timeout=timeout)
-
-def relink_and_export_batch(jobs: List[Dict],
-                            ps_exe: Optional[str] = None, timeout: int = 240) -> List[Dict]:
+def relink_and_export_batch(items: List[Dict], ps_exe: Optional[str] = None, timeout: int = 240) -> List[Dict]:
     """
-    Batch mode cho route:
-      - jobs: list[dict] từ order_processor, mỗi dict phải có psd_path/img_path/out_path
-      - cập nhật trạng thái IN-PLACE và trả lại jobs
+    Nhận list items từ order_processor (status=READY) và cố export.
+    - Nếu KHÔNG tìm thấy Photoshop, KHÔNG gán ERROR: giữ nguyên READY và ghi chú.
+    - Nếu export OK: status=OK, điền output_path (đã có sẵn).
+    - Nếu lỗi: status=ERROR + error.
     """
-    if not isinstance(jobs, list):
-        raise TypeError("jobs phải là list[dict].")
+    if not isinstance(items, list): return items
 
-    for i, job in enumerate(jobs):
-        if not isinstance(job, dict):
-            jobs[i] = {"status": "ERROR", "reason": "Job không phải dict"}
+    exe = _find_photoshop_exe(ps_exe)
+    if not exe:
+        # Photoshop chưa sẵn sàng → không render, giữ READY
+        for it in items:
+            if it.get("status") == "READY":
+                it.setdefault("error", None)
+                if not it["error"]:
+                    it["error"] = "Photoshop chưa cấu hình — bỏ qua bước render."
+        return items
+
+    for it in items:
+        if it.get("status") != "READY":
             continue
 
-        if job.get("status") != "READY":
-            # Bỏ qua SKIP/ERROR đã đánh dấu từ khâu chuẩn bị
-            continue
-
-        psd = job.get("psd_path")
-        inp = job.get("img_path")
-        outp = job.get("out_path")
-        if not (psd and inp and outp):
-            job["status"] = "ERROR"
-            job["reason"] = "Thiếu psd_path/img_path/out_path"
+        psd = it.get("_psd_path")
+        img = it.get("_img_path")
+        outp = it.get("output_path")
+        if not (psd and img and outp):
+            it["status"] = "ERROR"
+            it["error"]  = "Thiếu đường dẫn psd/img/output."
             continue
 
         try:
-            ok = _relink_and_export_single(psd, inp, outp, ps_exe=ps_exe, timeout=timeout)
-            job["status"] = "OK" if ok else "ERROR"
+            ok = _relink_and_export_single(exe, psd, img, outp, timeout=timeout)
             if ok:
-                job["output"] = outp
+                it["status"] = "OK"
             else:
-                job["reason"] = "Export timed out or failed."
+                it["status"] = "ERROR"
+                it["error"]  = "Export time-out/failed."
         except Exception as e:
-            job["status"] = "ERROR"
-            job["reason"] = str(e)
+            it["status"] = "ERROR"
+            it["error"]  = str(e)
         finally:
-            if job.get("tmp_img") and isinstance(inp, str) and os.path.isfile(inp):
-                try: os.remove(inp)
+            if it.get("_tmp_img") and isinstance(img, str) and os.path.isfile(img):
+                try: os.remove(img)
                 except Exception: pass
 
-    return jobs
+    return items

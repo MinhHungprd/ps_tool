@@ -65,10 +65,7 @@ else {{
 """
 
 DEFAULT_PS_EXE = [
-    r"C:\Program Files\Adobe\Adobe Photoshop 2025\Photoshop.exe",
-    r"C:\Program Files\Adobe\Adobe Photoshop 2024\Photoshop.exe",
-    r"C:\Program Files\Adobe\Adobe Photoshop 2023\Photoshop.exe",
-    r"C:\Program Files\Adobe\Adobe Photoshop\Photoshop.exe",
+    r"D:\Adobe Photoshop 2022 v23.0.0.36 (x64) Multilingual\Adobe Photoshop 2022\Photoshop.exe",
 ]
 
 def find_photoshop_exe(user_path: str | None) -> str:

@@ -1,29 +1,14 @@
 # app/routes.py
-# ============================================================
-# ROUTES:
-#   - "/" (GET/POST): Trang xử lý đơn (giữ nguyên logic cũ bên trong POST)
-#   - "/templates": Trang quản lý Template PSD (UI)
-#   - "/api/templates/tree": Liệt kê loại áo & size có sda.psd
-#   - "/api/templates/upload": Upload/thay thế -> lưu .../{type}/{size}/sda.psd
-#   - "/api/templates/delete": Xoá size hoặc xoá cả loại
-#   - "/api/templates/rename": Đổi tên loại áo hoặc size (KHÔNG đổi tên file)
-# Tất cả trang/API đều yêu cầu đăng nhập (login_required).
-# ============================================================
+from flask import Blueprint, request, render_template, jsonify, abort
+import os, shutil
 
-from flask import Blueprint, request, render_template, jsonify
-import os
-import shutil
-
-# ---- auth guard (ENV TK/MK không mã hoá) ----
 from app.auth import login_required
 
 main = Blueprint('main', __name__)
 
-# ===== Helpers tên an toàn (giữ Unicode, cho phép () & tiếng Việt) =====
+# ===== Helpers tên an toàn =====
 _WIN_FORBIDDEN = set('\\/:*?"<>|')
-_RESERVED = {
-    'CON','PRN','AUX','NUL', *(f'COM{i}' for i in range(1,10)), *(f'LPT{i}' for i in range(1,10)),
-}
+_RESERVED = {'CON','PRN','AUX','NUL', *(f'COM{i}' for i in range(1,10)), *(f'LPT{i}' for i in range(1,10))}
 def _fs_sanitize(name: str) -> str:
     if name is None: raise ValueError("Tên rỗng.")
     s = name.strip()
@@ -46,7 +31,7 @@ def _fs_sanitize(name: str) -> str:
 @login_required
 def index():
     """
-    GET  -> render templates/index.html (UI cũ)
+    GET  -> render templates/index.html (full page lần đầu)
     POST -> GIỮ NGUYÊN LOGIC CŨ
     """
     if request.method == 'POST':
@@ -85,20 +70,33 @@ def index():
 
         return jsonify(payload)
 
-    return render_template('index.html')
-
+    return render_template('index.html')   # full page
 
 # -------------------- (2) TEMPLATE MANAGER --------------------
-# Cấu trúc lưu: storage/templates/{loại áo}/{size}/sda.psd
 TPL_ROOT = os.path.join('storage', 'templates')
 
 @main.route('/templates', methods=['GET'])
 @login_required
 def template_manager():
-    return render_template('folder_manager.html')
+    return render_template('folder_manager.html')  # full page
 
+# -------------------- (3) PARTIALS CHO SPA --------------------
+@main.route('/partial/<page>', methods=['GET'])
+@login_required
+def partial(page: str):
+    """
+    Trả về CHỈ phần body HTML để client fetch() và chèn vào #main-content.
+    """
+    mapping = {
+        "orders": "partials/orders_partial.html",
+        "templates": "partials/templates_partial.html",
+    }
+    tpl = mapping.get(page)
+    if not tpl:
+        abort(404)
+    return render_template(tpl)
 
-# Trả cây template: [{type: "AoThun", sizes: ["S","M","L"]}, ...]
+# -------------------- (4) API QUẢN LÝ TEMPLATE --------------------
 @main.route('/api/templates/tree', methods=['GET'])
 @login_required
 def template_tree():
@@ -106,21 +104,17 @@ def template_tree():
     result = []
     for type_name in sorted(os.listdir(TPL_ROOT)):
         type_path = os.path.join(TPL_ROOT, type_name)
-        if not os.path.isdir(type_path):
-            continue
+        if not os.path.isdir(type_path): continue
         sizes = []
         for size in sorted(os.listdir(type_path)):
             size_path = os.path.join(type_path, size)
-            if not os.path.isdir(size_path):
-                continue
+            if not os.path.isdir(size_path): continue
             psd_path = os.path.join(size_path, 'sda.psd')
             if os.path.isfile(psd_path):
                 sizes.append(size)
         result.append({"type": type_name, "sizes": sizes})
     return jsonify({"items": result})
 
-
-# Upload / Thay thế -> luôn lưu thành .../{type}/{size}/sda.psd
 @main.route('/api/templates/upload', methods=['POST'])
 @login_required
 def template_upload():
@@ -150,8 +144,6 @@ def template_upload():
     except Exception:
         return jsonify({"error": "Upload thất bại"}), 500
 
-
-# Xoá: có 'size' -> xoá size; không có -> xoá cả loại
 @main.route('/api/templates/delete', methods=['DELETE'])
 @login_required
 def template_delete():
@@ -161,7 +153,7 @@ def template_delete():
 
         type_path = os.path.join(TPL_ROOT, type_name)
         if not os.path.isdir(type_path):
-            return jsonify({"ok": True})  # coi như đã xoá
+            return jsonify({"ok": True})
 
         if size_name_raw:
             size_name = _fs_sanitize(size_name_raw)
@@ -181,8 +173,6 @@ def template_delete():
     except Exception:
         return jsonify({"error": "Xóa thất bại"}), 500
 
-
-# Đổi tên loại hoặc size (KHÔNG đổi tên file .psd, chỉ rename thư mục)
 @main.route('/api/templates/rename', methods=['PATCH'])
 @login_required
 def template_rename():

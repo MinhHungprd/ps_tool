@@ -149,3 +149,23 @@ section .girl{
 @media (prefers-reduced-motion: reduce){
   .girl, .leaves .set div{ animation: none !important; }
 }
+ .mini-toast{
+      position: fixed;
+      left: 50%;
+      bottom: 24px;
+      transform: translateX(-50%);
+      background: rgba(0,0,0,.75);
+      color: #fff;
+      padding: 10px 14px;
+      border-radius: 10px;
+      font-size: 14px;
+      line-height: 1.4;
+      z-index: 9999;
+      box-shadow: 0 10px 30px rgba(0,0,0,.2);
+      opacity: 0;
+      transition: opacity .25s ease, transform .25s ease;
+      pointer-events: none;
+      max-width: calc(100vw - 40px);
+      text-align: center;
+    }
+    .mini-toast.show{ opacity: 1; transform: translate(-50%, -4px); }
