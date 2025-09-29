@@ -5,6 +5,24 @@
 {% block content %}
 <h1 class="mb-3 fw-bold">Xử lý đơn hàng tự động</h1>
 
+<h1 class="mb-3 fw-bold">Xử lý đơn hàng tự động</h1>
+
+{% if drive_connected %}
+  <div class="alert alert-success d-flex align-items-center gap-2">
+    <span class="me-2">✔️ Đã kết nối Google Drive</span>
+    <a href="{{ url_for('main.disconnect_drive') }}" class="btn btn-sm btn-outline-success ms-auto">
+      Ngắt kết nối
+    </a>
+  </div>
+{% else %}
+  <div class="mb-3">
+    <a href="{{ url_for('main.connect_drive') }}" class="btn btn-success">
+      <i class="bi bi-google"></i> Kết nối Google Drive
+    </a>
+  </div>
+{% endif %}
+
+
 <form id="order-form" method="POST" enctype="multipart/form-data" class="card p-3 p-md-4">
   <div class="mb-3">
     <label for="excel_file" class="form-label">Upload file Excel đơn hàng</label>

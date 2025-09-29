@@ -1,0 +1,9 @@
+{
+  "access_token": "ya29.a0AQQ_BDT7QqIBk-PlL4xJ3MLz4OuVsH_Vp3yu19Cgg6iAKEbobBasyvHYBvapceuoH-AhlYSlukTe_XuPJCKah5TMHgSnz_CeSmYpEJk2xv2DF_hj_SsNNOzid7DzGpdGpnFg1K1FyHpT6qLs6fYHI7daOglSa9A4fkA8UkDBbTj0OsAUETTN1YVMChu57eo1t9rAlJoaCgYKAaESARESFQHGX2MiDgva5nFMgvWj3ET_-Fk1wA0206",
+  "refresh_token": "1//0gPZi-0AHmRhhCgYIARAAGBASNwF-L9IrxkVVcUGAvwH_cd9teORGjldyuWEMEeqZqCtWh0QCvykGtsGdukRYfvadio9JtQRklxQ",
+  "expiry": "2025-09-29T16:40:53",
+  "created_at": 1759160454,
+  "scope": [
+    "https://www.googleapis.com/auth/drive.file"
+  ]
+}

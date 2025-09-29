@@ -1,6 +1,8 @@
 # app/routes.py
-from flask import Blueprint, request, render_template, jsonify, abort
+from flask import Blueprint, request, render_template, jsonify, abort, redirect, url_for, session
 import os, shutil
+import json, time
+from google_auth_oauthlib.flow import Flow
 
 from app.auth import login_required
 
@@ -53,6 +55,10 @@ def index():
                 from app.services.psd_handler import relink_and_export_batch
             except Exception:
                 relink_and_export_batch = None
+            try:
+                from app.services.drive_sync import sync_outputs_to_drive
+            except Exception:
+                sync_outputs_to_drive = None
 
             sheet = request.form.get('sheet') or 'data'
             limit_raw = request.form.get('limit')
@@ -62,6 +68,8 @@ def index():
                 job = process_order_from_excel(saved_path, sheet=sheet, limit=limit)
                 if relink_and_export_batch:
                     relink_and_export_batch(job)
+                    sync_outputs_to_drive(delete_local=True)
+
                 payload = job
             else:
                 payload = []
@@ -70,7 +78,7 @@ def index():
 
         return jsonify(payload)
 
-    return render_template('index.html')   # full page
+    return render_template('index.html', drive_connected=(session.get("drive_connected") or _has_drive_connection())) # full page
 
 # -------------------- (2) TEMPLATE MANAGER --------------------
 TPL_ROOT = os.path.join('storage', 'templates')
@@ -219,3 +227,105 @@ def template_rename():
         return jsonify({"error": str(ve)}), 400
     except Exception:
         return jsonify({"error": "Đổi tên thất bại"}), 500
+    
+
+# ==== GOOGLE DRIVE OAUTH + LƯU TOKEN BỀN VỮNG ====
+# Cho phép HTTP khi dev
+os.environ.setdefault("OAUTHLIB_INSECURE_TRANSPORT", "1")
+
+REDIRECT_URI = os.getenv("OAUTH_REDIRECT_URI", "http://localhost:5000/oauth2/callback")
+TOKEN_DB = os.path.join("storage/driveSession", "drive_tokens.json")
+
+def _client_config():
+    return {
+        "web": {
+            "client_id": os.getenv("GOOGLE_CLIENT_ID"),
+            "client_secret": os.getenv("GOOGLE_CLIENT_SECRET"),
+            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+            "token_uri": "https://oauth2.googleapis.com/token",
+            "redirect_uris": [REDIRECT_URI],
+        }
+    }
+
+def _load_tokens():
+    try:
+        if os.path.isfile(TOKEN_DB):
+            with open(TOKEN_DB, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return None
+
+def _save_tokens(creds):
+    os.makedirs("storage", exist_ok=True)
+    data = {
+        "access_token": getattr(creds, "token", None),
+        "refresh_token": getattr(creds, "refresh_token", None),
+        "expiry": getattr(creds, "expiry", None).isoformat() if getattr(creds, "expiry", None) else None,
+        "created_at": int(time.time()),
+        "scope": getattr(creds, "scopes", None),
+    }
+    with open(TOKEN_DB, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+def _has_drive_connection():
+    tok = _load_tokens()
+    return bool(tok and tok.get("refresh_token"))
+
+@main.route("/connect-drive")
+@login_required
+def connect_drive():
+    flow = Flow.from_client_config(
+        _client_config(),
+        scopes=[
+            "https://www.googleapis.com/auth/drive.file",
+            # (không bắt buộc) Nếu muốn lấy email user sau này:
+            # "openid", "https://www.googleapis.com/auth/userinfo.email"
+        ],
+    )
+    flow.redirect_uri = REDIRECT_URI
+
+    authorization_url, state = flow.authorization_url(
+        access_type="offline",
+        prompt="consent",
+        include_granted_scopes="true",
+    )
+    session["oauth_state"] = state
+    print("[OAUTH] redirect_uri =", flow.redirect_uri)
+    print("[OAUTH] auth_url     =", authorization_url)
+    return redirect(authorization_url)
+
+@main.route("/oauth2/callback")
+@login_required
+def oauth2_callback():
+    try:
+        flow = Flow.from_client_config(
+            _client_config(),
+            scopes=["https://www.googleapis.com/auth/drive.file"],
+            state=session.get("oauth_state"),
+        )
+        flow.redirect_uri = REDIRECT_URI
+        flow.fetch_token(authorization_response=request.url)
+        creds = flow.credentials
+        _save_tokens(creds)
+        session["drive_connected"] = True
+        print("[OAUTH] connected; has_refresh_token:", bool(getattr(creds, "refresh_token", None)))
+        return redirect(url_for("main.index"))
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        return "OAuth callback error: " + str(e), 500
+
+@main.route("/disconnect-drive")
+@login_required
+def disconnect_drive():
+    try:
+        if os.path.exists(TOKEN_DB):
+            os.remove(TOKEN_DB)
+    except Exception:
+        pass
+    session.pop("drive_connected", None)
+    return redirect(url_for("main.index"))
+
+
+
+
