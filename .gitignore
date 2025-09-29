@@ -125,9 +125,7 @@ Thumbs.db
 # ===================== #
 
 # Ảnh JPG
-*.jpg
-*.jpeg
-*.png
+
 
 # File Photoshop
 *.psd
