@@ -1,7 +1,8 @@
 # app/routes.py
-from flask import Blueprint, request, render_template, jsonify, abort, redirect, url_for, session
+from flask import Blueprint, request, render_template, jsonify, abort, redirect, url_for, session,Response, stream_with_context
 import os, shutil, secrets
 from pathlib import Path
+from datetime import datetime, timedelta
 import json, time
 from google_auth_oauthlib.flow import Flow
 
@@ -81,12 +82,9 @@ def index():
         except Exception:
             sync_outputs_to_drive = None
 
-        import json, time
-        from flask import Response, stream_with_context
-
         def _jsonline(obj: dict) -> str:
             return json.dumps(obj, ensure_ascii=False) + "\n"
-        
+
         def _safe_unlink(p: str) -> bool:
             try:
                 if p and os.path.isfile(p):
@@ -104,18 +102,13 @@ def index():
             Trả về tổng số file đã xóa.
             """
             removed = 0
-            # 1) gom danh sách tmp của job
             job_tmp = set()
             for it in (job or []):
                 p = it.get("_tmp_img")
                 if isinstance(p, str) and p:
                     job_tmp.add(os.path.abspath(p))
-
-            # 2) xóa _tmp_img còn tồn tại
             for p in list(job_tmp):
                 removed += 1 if _safe_unlink(p) else 0
-
-            # 3) xóa file lẻ trong storage/tmp
             try:
                 abs_tmp = os.path.abspath(tmp_dir)
                 if os.path.isdir(abs_tmp):
@@ -129,7 +122,6 @@ def index():
                             removed += 1 if _safe_unlink(full) else 0
             except Exception:
                 pass
-
             return removed
 
         def gen():
@@ -140,25 +132,38 @@ def index():
                     yield _jsonline({"type": "error", "message": "Thiếu process_order_from_excel"})
                     return
 
+                # Bắt đầu đo thời gian
+                t0 = time.time()
+                start_iso = datetime.now().isoformat()
+
                 job = process_order_from_excel(saved_path, sheet=sheet, limit=limit)  # list[dict]
                 total = len(job) if job else 0
-                yield _jsonline({"type": "start", "total": total, "batch_size": batch_size, "report_every": report_every})
+                yield _jsonline({
+                    "type": "start",
+                    "total": total,
+                    "batch_size": batch_size,
+                    "report_every": report_every,
+                    "timing": {"started_at": start_iso}
+                })
 
                 if not job or not relink_and_export_batch:
-                    yield _jsonline({"type": "done", "items": job or []})
+                    elapsed = int(time.time() - t0)
+                    yield _jsonline({"type": "done", "items": job or [], "timing": {
+                        "elapsed_sec": elapsed,
+                        "finished_at": datetime.now().isoformat()
+                    }})
                     return
 
                 done = 0
                 batch_count = 0
-                pending_report_items = []   # gom kết quả các lô chờ report
-                processed_since_last_upload = 0
+                pending_report_items = []
 
                 # Chia theo lô
                 for start in range(0, total, batch_size):
                     chunk = job[start:start + batch_size]
                     updated = relink_and_export_batch(chunk) or []
 
-                    # ghi kết quả ngược lại vào job + gom phần cần report
+                    # ghi kết quả + gom report
                     for i, it2 in enumerate(updated):
                         job_idx = start + i
                         if job_idx < len(job):
@@ -168,23 +173,30 @@ def index():
                     # cập nhật đếm
                     done += len(updated)
                     batch_count += 1
-                    processed_since_last_upload += len(updated)
 
-                    # sau mỗi lô: có thể upload ngay (tuỳ bạn, để true để an toàn)
+                    # sync sau mỗi lô (nếu bật)
                     if sync_outputs_to_drive:
                         try:
                             sync_outputs_to_drive(delete_local=True, user=session.get('user'))
                         except Exception as e:
-                            yield _jsonline({"type":"upload_error","message":str(e)})
+                            yield _jsonline({"type": "upload_error", "message": str(e)})
 
-                    # khi đủ n lô, xuất trạng thái
+                    # khi đủ n lô, xuất trạng thái + timing
                     if batch_count % report_every == 0:
+                        elapsed = time.time() - t0
+                        eta_sec = None
+                        finish_at = None
+                        if done > 0 and total > 0:
+                            rate = done / max(elapsed, 1e-6)  # items/sec
+                            remain = max(total - done, 0)
+                            eta_sec = int(round(remain / max(rate, 1e-9)))
+                            finish_at = (datetime.now() + timedelta(seconds=eta_sec)).isoformat()
                         yield _jsonline({
                             "type": "progress",
                             "done": done,
                             "total": total,
                             "batch_count": batch_count,
-                            "last_batches": [  # gửi gọn những item của n lô vừa rồi
+                            "last_batches": [
                                 {
                                     "order_id": it.get("order_id"),
                                     "template": it.get("template"),
@@ -192,15 +204,28 @@ def index():
                                     "status": it.get("status"),
                                     "error": it.get("error"),
                                 } for it in pending_report_items
-                            ]
+                            ],
+                            "timing": {
+                                "elapsed_sec": int(elapsed),
+                                "eta_sec": eta_sec,
+                                "finish_at": finish_at
+                            }
                         })
                         pending_report_items.clear()
 
                     # nhả nhịp nhỏ để flush
                     time.sleep(0.001)
 
-                # report phần còn lại nếu chưa đủ n lô để report
+                # report phần còn lại nếu có
                 if pending_report_items:
+                    elapsed = time.time() - t0
+                    eta_sec = None
+                    finish_at = None
+                    if done > 0 and total > 0:
+                        rate = done / max(elapsed, 1e-6)
+                        remain = max(total - done, 0)
+                        eta_sec = int(round(remain / max(rate, 1e-9)))
+                        finish_at = (datetime.now() + timedelta(seconds=eta_sec)).isoformat()
                     yield _jsonline({
                         "type": "progress",
                         "done": done,
@@ -214,13 +239,27 @@ def index():
                                 "status": it.get("status"),
                                 "error": it.get("error"),
                             } for it in pending_report_items
-                        ]
+                        ],
+                        "timing": {
+                            "elapsed_sec": int(elapsed),
+                            "eta_sec": eta_sec,
+                            "finish_at": finish_at
+                        }
                     })
                     pending_report_items.clear()
 
-                # Kết thúc
-                yield _jsonline({"type": "done", "items": job})
-                
+                # Kết thúc + tổng thời gian
+                total_elapsed = int(time.time() - t0)
+                yield _jsonline({
+                    "type": "done",
+                    "items": job,
+                    "timing": {
+                        "elapsed_sec": total_elapsed,
+                        "finished_at": datetime.now().isoformat()
+                    }
+                })
+
+                # Dọn ảnh tạm
                 try:
                     removed = _cleanup_tmp_leftovers(job, tmp_dir="storage/tmp")
                     yield _jsonline({"type": "tmp_cleanup", "removed": int(removed)})
@@ -236,10 +275,14 @@ def index():
             "X-Accel-Buffering": "no",
             "Connection": "keep-alive",
         }
-        return Response(stream_with_context(gen()), headers=headers)  # bỏ direct_passthrough
+        return Response(stream_with_context(gen()), headers=headers)
 
     # GET → render trang
-    return render_template('index.html',drive_connected=(session.get("drive_connected") or _has_drive_connection(username=session.get('user'))) )
+    return render_template(
+        'index.html',
+        drive_connected=(session.get("drive_connected") or _has_drive_connection(username=session.get('user')))
+    )
+
 
 
 # -------------------- (2) TEMPLATE MANAGER --------------------

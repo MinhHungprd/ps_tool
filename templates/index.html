@@ -60,10 +60,13 @@ function ensureTable() {
   resultsEl.innerHTML = `
     <div class="card">
       <div class="card-body">
-        <div class="d-flex align-items-center mb-3">
-          <h5 class="card-title mb-0">Kết quả</h5>
-          <span id="progress-badge" class="badge text-bg-info ms-3">0/0</span>
-          <span id="batch-badge" class="badge text-bg-secondary ms-2">Batch: 0</span>
+        <div class="d-flex flex-wrap align-items-center gap-2 mb-3">
+          <h5 class="card-title mb-0 me-2">Kết quả</h5>
+          <span id="progress-badge" class="badge text-bg-info">0/0</span>
+          <span id="batch-badge" class="badge text-bg-secondary">Batch: 0</span>
+          <span id="elapsed-badge" class="badge text-bg-dark">Đã chạy: 00:00</span>
+          <span id="eta-badge" class="badge text-bg-primary">Còn lại: --</span>
+          <span id="finish-badge" class="badge text-bg-success">Dự kiến xong: --</span>
         </div>
         <div class="table-responsive">
           <table class="table table-striped align-middle">
@@ -84,12 +87,38 @@ function ensureTable() {
     </div>
   `;
 }
-function setProgress(done, total, batchCount) {
+
+function fmtSec(sec) {
+  if (sec == null || isNaN(sec)) return "--";
+  sec = Math.max(0, Math.floor(sec));
+  const h = Math.floor(sec / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  const s = sec % 60;
+  if (h > 0) return `${h}h ${String(m).padStart(2,'0')}m ${String(s).padStart(2,'0')}s`;
+  return `${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
+}
+
+function setProgress(done, total, batchCount, timing) {
   const pb = document.getElementById("progress-badge");
   const bb = document.getElementById("batch-badge");
+  const eb = document.getElementById("elapsed-badge");
+  const etb = document.getElementById("eta-badge");
+  const fb = document.getElementById("finish-badge");
   if (pb) pb.textContent = `${done}/${total}`;
   if (bb) bb.textContent = `Batch: ${batchCount ?? 0}`;
+  if (timing) {
+    if (eb && typeof timing.elapsed_sec !== "undefined") {
+      eb.textContent = `Đã chạy: ${fmtSec(timing.elapsed_sec)}`;
+    }
+    if (etb) {
+      etb.textContent = `Còn lại: ${fmtSec(timing.eta_sec)}`;
+    }
+    if (fb) {
+      fb.textContent = `Dự kiến xong: ${timing.finish_at ? new Date(timing.finish_at).toLocaleString() : "--"}`;
+    }
+  }
 }
+
 function appendRows(items) {
   const tbody = document.getElementById("result-body");
   if (!tbody) return;
@@ -137,20 +166,24 @@ form.addEventListener("submit", async (e) => {
         try { msg = JSON.parse(line); } catch { continue; }
 
         if (msg.type === "start") {
-          setProgress(0, msg.total ?? 0, 0);
+          setProgress(0, msg.total ?? 0, 0, msg.timing || null);
         } else if (msg.type === "progress") {
-          // Mốc QUAN TRỌNG: chỉ đẩy sau mỗi n batch
           const last = Array.isArray(msg.last_batches) ? msg.last_batches : [];
           appendRows(last);
-          setProgress(msg.done ?? 0, msg.total ?? 0, msg.batch_count ?? 0);
+          setProgress(msg.done ?? 0, msg.total ?? 0, msg.batch_count ?? 0, msg.timing || null);
         } else if (msg.type === "upload_error") {
           console.warn("Upload error:", msg.message);
         } else if (msg.type === "error") {
           resultsEl.insertAdjacentHTML("afterbegin",
             `<div class="alert alert-danger">Lỗi: ${msg.message}</div>`);
         } else if (msg.type === "done") {
-          // tuỳ chọn: nếu muốn render lại toàn bộ
-          // resultsEl.innerHTML = renderItems(msg.items || []);
+          setProgress(
+            (msg.items || []).length, (msg.items || []).length,
+            undefined,
+            msg.timing || null
+          );
+        } else if (msg.type === "tmp_cleanup") {
+          console.log("Đã xóa ảnh tạm:", msg.removed);
         }
       }
     }
@@ -159,5 +192,4 @@ form.addEventListener("submit", async (e) => {
   }
 });
 </script>
-
 {% endblock %}

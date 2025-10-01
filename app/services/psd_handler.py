@@ -33,6 +33,7 @@ JPEG_QUALITY = int(os.getenv("JPEG_QUALITY", "12"))  # 0-12
 POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "0.25"))  # giây
 SINGLE_TIMEOUT = int(os.getenv("SINGLE_TIMEOUT", "540"))   # giây cho 1 output
 BATCH_TIMEOUT = int(os.getenv("BATCH_TIMEOUT", "1040"))    # giây cho batch
+TEXT_LAYER_NAME = os.getenv("TEXT_LAYER_NAME", "idsp")     # tên layer chữ cần gán (mặc định: idsp)
 
 # ========= Import drive_sync để kiểm tra trùng tên trên Drive =========
 from app.services import drive_sync as dsync
@@ -41,12 +42,17 @@ from app.services import drive_sync as dsync
 JSX_TEMPLATE = r"""#target photoshop
 app.displayDialogs = DialogModes.NO;
 
+// giảm overhead UI/History
+try {{ app.preferences.numberOfHistoryStates = 2; }} catch(e) {{}}
+try {{ app.preferences.exportClipboard = false; }} catch(e) {{}}
+
 var psdPath = "{psd}";
 var imgPath = "{img}";
 var outPath = "{out}";
 var okFlag  = outPath + ".ok";
 var errFlag = outPath + ".err";
 var JPEG_QUALITY = {jpeg_quality};
+var textLayerName = "{text_layer}"; // fast-path nếu đặt tên cố định
 
 // ---------- Helpers ----------
 function isSmartObjectLayer(ly) {{ try {{ return ly.kind == LayerKind.SMARTOBJECT; }} catch (e) {{ return false; }} }}
@@ -84,25 +90,53 @@ function enableUnicodeComposerIfSupported(textItem) {{
         try {{ textItem.useAutoKern = true; }} catch(e) {{}}
     }} catch(e) {{}}
 }}
-function setFirstTextLayer(container, newText) {{
+
+// ---- Fast path theo tên layer + fallback đệ quy ----
+function findFirstTextRec(container) {{
     for (var i=0; i<container.layers.length; i++) {{
         var ly = container.layers[i];
         if (ly.typename === "LayerSet") {{
-            if (setFirstTextLayer(ly, newText)) return true;
+            var hit = findFirstTextRec(ly);
+            if (hit) return hit;
         }} else if (isTextLayer(ly)) {{
-            try {{ if (ly.allLocked) ly.allLocked = false; }} catch(e) {{}}
-            try {{
-                ly.visible = true;
-                enableUnicodeComposerIfSupported(ly.textItem);
-                ly.textItem.contents = newText;
-            }} catch(e) {{
-                return false;
-            }}
-            return true;
+            return ly;
         }}
     }}
-    return false;
+    return null;
 }}
+function getTextLayerFast(doc, name) {{
+    if (!name) return null;
+    // thử trực tiếp ở root
+    try {{ return doc.artLayers.getByName(name); }} catch(e) {{}}
+    // thử group cùng tên (1 cấp), rồi tìm text layer đầu tiên bên trong
+    try {{
+        var grp = doc.layerSets.getByName(name);
+        for (var i=0;i<grp.layers.length;i++) {{
+            var ly = grp.layers[i];
+            if (isTextLayer(ly)) return ly;
+            if (ly.typename === "LayerSet") {{
+                var ly2 = findFirstTextRec(ly);
+                if (ly2) return ly2;
+            }}
+        }}
+    }} catch(e) {{}}
+    return null;
+}}
+function setTextFastOrFirst(doc, newText) {{
+    var target = getTextLayerFast(doc, textLayerName);
+    if (!target) {{
+        target = findFirstTextRec(doc);
+    }}
+    if (!target) return false;
+    try {{ if (target.allLocked) target.allLocked = false; }} catch(e) {{}}
+    try {{
+        enableUnicodeComposerIfSupported(target.textItem);
+        target.visible = true;
+        target.textItem.contents = newText;
+        return true;
+    }} catch(e) {{ return false; }}
+}}
+
 function basenameNoExt(p) {{
     var f = new File(p);
     var n = f.name;
@@ -156,11 +190,11 @@ function writeFlag(p, txt) {{
     }} catch(e) {{}}
 }}
 
-// ----------------- MAIN with error flags -----------------
-try {{
-    var psdFile = new File(psdPath);
-    if (!psdFile.exists) throw new Error("PSD not found: " + psdPath);
-    var doc = app.open(psdFile);
+// ----------------- MAIN (suspendHistory trên Document) -----------------
+
+// Thao tác chính, dùng activeDocument trong thân để tương thích suspendHistory
+function _main() {{
+    var doc = app.activeDocument;
 
     var ok = walkAndRelinkFirstSO(doc, imgPath);
     if (!ok) {{
@@ -170,13 +204,32 @@ try {{
 
     var outName = basenameNoExt(outPath);
     try {{ outName = decodeURIComponent(outName); }} catch(e) {{}}
-    setFirstTextLayer(doc, outName);
+    setTextFastOrFirst(doc, outName);
 
     var dup = doc.duplicate();
     saveJPEG_HQ(dup, outPath, JPEG_QUALITY);
 
     dup.close(SaveOptions.DONOTSAVECHANGES);
     doc.close(SaveOptions.DONOTSAVECHANGES);
+}}
+
+try {{
+    var psdFile = new File(psdPath);
+    if (!psdFile.exists) throw new Error("PSD not found: " + psdPath);
+
+    // Mở document trước…
+    var doc = app.open(psdFile);
+
+    // …rồi gói thao tác vào doc.suspendHistory nếu có, không thì fallback
+    try {{
+        if (doc && doc.suspendHistory) {{
+            doc.suspendHistory("BatchRelinkExport", "_main()");
+        }} else {{
+            _main();
+        }}
+    }} catch (e2) {{
+        _main();
+    }}
 
     writeFlag(okFlag, "OK");
 }} catch(e) {{
@@ -184,6 +237,7 @@ try {{
     throw e;
 }}
 """
+
 
 DEFAULT_PS_EXE = [
     r"D:\DATA\Adobe\Adobe Photoshop 2022\photoshop.exe",
@@ -260,7 +314,16 @@ class _PhotoshopBridge:
         out_abs = os.path.abspath(out_path).replace("\\", "/")
         os.makedirs(os.path.dirname(out_abs), exist_ok=True)
 
-        jsx_code = JSX_TEMPLATE.format(psd=psd_abs, img=img_abs, out=out_abs, jpeg_quality=JPEG_QUALITY)
+        # Truyền tên layer cố định (ENV TEXT_LAYER_NAME) vào JSX
+        text_layer_name = (TEXT_LAYER_NAME or "").replace('"', '\\"')
+
+        jsx_code = JSX_TEMPLATE.format(
+            psd=psd_abs,
+            img=img_abs,
+            out=out_abs,
+            jpeg_quality=JPEG_QUALITY,
+            text_layer=text_layer_name
+        )
 
         if self.mode == "com":
             try:
