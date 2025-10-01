@@ -10,7 +10,7 @@ try:
 except Exception:
     pass
 
-# ---- Google Drive deps ----
+# ---- Google Drive deps (giữ nguyên nếu chưa dùng) ----
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -24,11 +24,18 @@ try:
     SCOPES = _SC
 except Exception:
     CREDENTIALS_FILE = "app/config/credentials.json"
-    # drive.file đủ để tạo/thao tác file do app tạo
     SCOPES = ["https://www.googleapis.com/auth/drive.file"]
 
-# ========= NEW: lấy tên thư mục Drive từ ENV (hoặc mặc định) =========
-DRIVE_FOLDER_NAME_ENV = os.getenv("DRIVE_FOLDER_NAME", "save_file_in")  # <-- CHANGED
+# ========= ENV cấu hình =========
+DRIVE_FOLDER_NAME_ENV = os.getenv("DRIVE_FOLDER_NAME", "save_file_in")
+USE_PS_COM = os.getenv("USE_PS_COM", "0") == "1"      # 1: dùng COM nếu có; 0: subprocess
+JPEG_QUALITY = int(os.getenv("JPEG_QUALITY", "12"))  # 0-12
+POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "0.25"))  # giây
+SINGLE_TIMEOUT = int(os.getenv("SINGLE_TIMEOUT", "540"))   # giây cho 1 output
+BATCH_TIMEOUT = int(os.getenv("BATCH_TIMEOUT", "1040"))    # giây cho batch
+
+# ========= Import drive_sync để kiểm tra trùng tên trên Drive =========
+from app.services import drive_sync as dsync
 
 # ================== JSX để chạy trong Photoshop ==================
 JSX_TEMPLATE = r"""#target photoshop
@@ -39,14 +46,9 @@ var imgPath = "{img}";
 var outPath = "{out}";
 var okFlag  = outPath + ".ok";
 var errFlag = outPath + ".err";
+var JPEG_QUALITY = {jpeg_quality};
 
 // ---------- Helpers ----------
-function replaceSmartObjectContents(newFile) {{
-    var idplacedLayerReplaceContents = stringIDToTypeID("placedLayerReplaceContents");
-    var desc = new ActionDescriptor();
-    desc.putPath(charIDToTypeID("null"), new File(newFile));
-    executeAction(idplacedLayerReplaceContents, desc, DialogModes.NO);
-}}
 function isSmartObjectLayer(ly) {{ try {{ return ly.kind == LayerKind.SMARTOBJECT; }} catch (e) {{ return false; }} }}
 function walkAndRelinkFirstSO(container, newFile) {{
     for (var i=0; i<container.layers.length; i++) {{
@@ -92,7 +94,7 @@ function setFirstTextLayer(container, newText) {{
             try {{
                 ly.visible = true;
                 enableUnicodeComposerIfSupported(ly.textItem);
-                ly.textItem.contents = newText; // giữ Unicode đã decode
+                ly.textItem.contents = newText;
             }} catch(e) {{
                 return false;
             }}
@@ -109,15 +111,39 @@ function basenameNoExt(p) {{
     return n;
 }}
 
-// --- Save PNG via Save For Web (ổn định, tránh dialog) ---
-function savePNG_SFW(doc, outPath) {{
+function ensureParentFolder(pathStr) {{
+    try {{
+        var f = new File(pathStr);
+        var folder = f.parent;
+        if (!folder.exists) folder.create();
+    }} catch (e) {{}}
+}}
+
+function normalizeForRaster(doc) {{
+    try {{
+        if (doc.bitsPerChannel && doc.bitsPerChannel == BitsPerChannelType.THIRTYTWO) {{
+            doc.bitsPerChannel = BitsPerChannelType.EIGHT;
+        }}
+    }} catch (e) {{}}
+    try {{
+        if (doc.mode != DocumentMode.RGB && doc.mode != DocumentMode.GRAYSCALE && doc.mode != DocumentMode.INDEXEDCOLOR) {{
+            doc.changeMode(ChangeMode.RGB);
+        }}
+    }} catch (e) {{}}
+}}
+
+function saveJPEG_HQ(doc, outPath, quality) {{
+    ensureParentFolder(outPath);
+    normalizeForRaster(doc);
+    try {{ doc.flatten(); }} catch (e) {{}}
+
     var f = new File(outPath);
-    var opts = new ExportOptionsSaveForWeb();
-    opts.format = SaveDocumentType.PNG;
-    opts.PNG8 = false;              // PNG-24
-    opts.transparency = true;       // giữ alpha nếu có
-    opts.includeProfile = false;
-    doc.exportDocument(f, ExportType.SAVEFORWEB, opts);
+    var opts = new JPEGSaveOptions();
+    opts.quality = quality; // 0–12
+    opts.embedColorProfile = true;
+    opts.formatOptions = FormatOptions.STANDARDBASELINE;
+    opts.matte = MatteType.NONE;
+    doc.saveAs(f, opts, true, Extension.LOWERCASE);
 }}
 
 function writeFlag(p, txt) {{
@@ -136,23 +162,19 @@ try {{
     if (!psdFile.exists) throw new Error("PSD not found: " + psdPath);
     var doc = app.open(psdFile);
 
-    // Relink smart object đầu tiên
     var ok = walkAndRelinkFirstSO(doc, imgPath);
     if (!ok) {{
         doc.close(SaveOptions.DONOTSAVECHANGES);
         throw new Error("No Smart Object layer found to relink.");
     }}
 
-    // Sửa text layer đầu tiên = decodeURIComponent(tên output không đuôi)
     var outName = basenameNoExt(outPath);
     try {{ outName = decodeURIComponent(outName); }} catch(e) {{}}
     setFirstTextLayer(doc, outName);
 
-    // Export PNG
     var dup = doc.duplicate();
-    // Nếu cần nền trong suốt: có thể comment dòng dưới
-    dup.flatten();
-    savePNG_SFW(dup, outPath);
+    saveJPEG_HQ(dup, outPath, JPEG_QUALITY);
+
     dup.close(SaveOptions.DONOTSAVECHANGES);
     doc.close(SaveOptions.DONOTSAVECHANGES);
 
@@ -177,7 +199,7 @@ def _find_photoshop_exe(user_path: Optional[str]) -> Optional[str]:
     w = which("Photoshop.exe")
     return w if w and os.path.isfile(w) else None
 
-def _wait_for_result(path: str, timeout: int = 240) -> Tuple[bool, Optional[str]]:
+def _wait_for_result(path: str, timeout: int = SINGLE_TIMEOUT) -> Tuple[bool, Optional[str]]:
     """
     Chờ file output hoặc cờ .ok; nếu có .err thì trả lỗi ngay.
     """
@@ -193,9 +215,8 @@ def _wait_for_result(path: str, timeout: int = 240) -> Tuple[bool, Optional[str]
                 return False, "Unknown Photoshop error."
         if os.path.isfile(path) or os.path.isfile(ok_flag):
             return True, None
-        time.sleep(0.5)
+        time.sleep(POLL_INTERVAL)
 
-    # Hết giờ: nếu có .err thì đọc để trả về
     if os.path.isfile(err_flag):
         try:
             return False, Path(err_flag).read_text(encoding="utf-8", errors="ignore")
@@ -203,114 +224,125 @@ def _wait_for_result(path: str, timeout: int = 240) -> Tuple[bool, Optional[str]
             pass
     return False, "Timeout waiting for export."
 
-def _force_png_path(path: str) -> str:
-    """Ép đuôi .png nếu chưa phải PNG."""
+def _force_jpg_path(path: str) -> str:
     p = Path(path)
-    if p.suffix.lower() != ".png":
-        p = p.with_suffix(".png")
+    if p.suffix.lower() not in [".jpg", ".jpeg"]:
+        p = p.with_suffix(".jpg")
     return str(p)
 
-# ================== Google Drive helpers ==================
+# ================== Photoshop Bridge (COM / Subprocess) ==================
 
-def _get_drive_service():
+class _PhotoshopBridge:
     """
-    NOTE:
-    - Dùng luồng OAuth local + lưu token.json.
-    - Nếu bạn đã có refresh_token khác (web flow), bạn có thể hoán đổi hàm này
-      sang đọc file token của web giống test_upload.py.
+    Bridge 2 chế độ:
+    - COM (win32com) nếu USE_PS_COM=1 và có Photoshop COM.
+    - Subprocess photoshop.exe -r JSX nếu không có COM.
     """
-    creds = None
-    if os.path.exists("token.json"):
-        creds = Credentials.from_authorized_user_file("token.json", SCOPES)
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-        else:
-            flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS_FILE, SCOPES)
-            creds = flow.run_local_server(port=0)
-        with open("token.json", "w") as f:
-            f.write(creds.to_json())
-    return build("drive", "v3", credentials=creds)
+    def __init__(self, ps_exe: Optional[str] = None, use_com: bool = USE_PS_COM):
+        self.mode = "subprocess"
+        self.exe = _find_photoshop_exe(ps_exe)
+        self.app = None  # COM app
+        if use_com:
+            try:
+                import win32com.client  # type: ignore
+                self.app = win32com.client.Dispatch('Photoshop.Application')
+                self.mode = "com"
+            except Exception as e:
+                print(f"[PS_BRIDGE] COM init failed, fallback to subprocess. Reason: {e}")
+                self.mode = "subprocess"
 
-def _ensure_drive_folder(service, folder_name: str) -> str:
-    """Tìm folder theo tên, nếu chưa có thì tạo; trả về folder_id."""
-    q = "name = '{0}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false".format(folder_name.replace("'", "\\'"))
-    res = service.files().list(q=q, spaces="drive", fields="files(id,name)", pageSize=1).execute()
-    files = res.get("files", [])
-    if files:
-        return files[0]["id"]
-    # create
-    meta = {
-        "name": folder_name,
-        "mimeType": "application/vnd.google-apps.folder"
-    }
-    folder = service.files().create(body=meta, fields="id").execute()
-    return folder["id"]
+        if self.mode == "subprocess" and not self.exe:
+            raise RuntimeError("Photoshop executable not found.")
 
-def _upload_file_to_folder(service, file_path: str, filename: str, folder_id: str) -> Dict[str, str]:
-    media = MediaFileUpload(file_path, mimetype="image/png", resumable=False)
-    body = {"name": filename, "parents": [folder_id]}
-    file = service.files().create(body=body, media_body=media, fields="id,webViewLink").execute()
-    return {"id": file.get("id"), "link": file.get("webViewLink")}
+    def relink_and_export(self, psd_path: str, img_path: str, out_path: str, timeout: int = SINGLE_TIMEOUT) -> Tuple[bool, Optional[str]]:
+        psd_abs = os.path.abspath(psd_path).replace("\\", "/")
+        img_abs = os.path.abspath(img_path).replace("\\", "/")
+        out_abs = os.path.abspath(out_path).replace("\\", "/")
+        os.makedirs(os.path.dirname(out_abs), exist_ok=True)
 
-# ================== Photoshop relink + export ==================
+        jsx_code = JSX_TEMPLATE.format(psd=psd_abs, img=img_abs, out=out_abs, jpeg_quality=JPEG_QUALITY)
 
-def _relink_and_export_single(ps_exe: str, psd_path: str, img_path: str, out_path: str, timeout: int = 240) -> Tuple[bool, Optional[str]]:
-    psd_abs = os.path.abspath(psd_path).replace("\\", "/")
-    img_abs = os.path.abspath(img_path).replace("\\", "/")
-    out_abs = os.path.abspath(out_path).replace("\\", "/")
-    os.makedirs(os.path.dirname(out_abs), exist_ok=True)
+        if self.mode == "com":
+            try:
+                self.app.DoJavaScript(jsx_code)  # type: ignore
+            except Exception as e:
+                # vẫn đợi cờ .err để lấy message chi tiết
+                print(f"[PS_BRIDGE][COM] DoJavaScript error: {e}")
+            ok, err = _wait_for_result(out_abs, timeout=timeout)
+            # dọn cờ
+            for flag in (out_abs + ".ok", out_abs + ".err"):
+                try:
+                    if os.path.isfile(flag): os.remove(flag)
+                except Exception:
+                    pass
+            return ok, err
 
-    jsx_code = JSX_TEMPLATE.format(psd=psd_abs, img=img_abs, out=out_abs)
-    with tempfile.NamedTemporaryFile(prefix="ps_relink_", suffix=".jsx", delete=False) as tf:
-        jsx_path = tf.name
-    Path(jsx_path).write_text(jsx_code, encoding="utf-8")
+        # subprocess fallback
+        with tempfile.NamedTemporaryFile(prefix="ps_relink_", suffix=".jsx", delete=False) as tf:
+            jsx_path = tf.name
+        Path(jsx_path).write_text(jsx_code, encoding="utf-8")
 
-    try:
-        subprocess.Popen([ps_exe, "-r", jsx_path], close_fds=True)
-    except Exception as e:
-        raise RuntimeError(f"Launch Photoshop failed: {e}")
-
-    ok, err = _wait_for_result(out_abs, timeout=timeout)
-
-    # dọn temp JSX + cờ
-    try: os.remove(jsx_path)
-    except Exception: pass
-    for flag in (out_abs + ".ok", out_abs + ".err"):
         try:
-            if os.path.isfile(flag):
-                os.remove(flag)
-        except Exception:
-            pass
+            subprocess.Popen([self.exe, "-r", jsx_path], close_fds=True)
+        except Exception as e:
+            try: os.remove(jsx_path)
+            except Exception: pass
+            raise RuntimeError(f"Launch Photoshop failed: {e}")
 
-    return ok, err
+        ok, err = _wait_for_result(out_abs, timeout=timeout)
 
-# ================== Batch pipeline + upload Drive ==================
+        # dọn temp JSX + cờ
+        try: os.remove(jsx_path)
+        except Exception: pass
+        for flag in (out_abs + ".ok", out_abs + ".err"):
+            try:
+                if os.path.isfile(flag):
+                    os.remove(flag)
+            except Exception:
+                pass
 
-def relink_and_export_batch(items: List[Dict], ps_exe: Optional[str] = None, timeout: int = 240) -> List[Dict]:
+        return ok, err
+
+# ================== Batch pipeline ==================
+
+def relink_and_export_batch(items: List[Dict], ps_exe: Optional[str] = None, timeout: int = BATCH_TIMEOUT) -> List[Dict]:
     """
-    Nhận list items từ order_processor (status=READY) và export PNG rồi upload lên Drive:
-    - Photoshop OK → status=OK, đồng thời upload vào thư mục (ENV) DRIVE_FOLDER_NAME.
-      Trả về it['drive_file_id'], it['drive_url'].
+    Nhận list items từ order_processor (status=READY):
+    - Nếu file đích đã có sẵn trên Google Drive (thư mục ngày) -> SKIPPED (kiểm tra THEO FILE như cũ).
+    - Photoshop OK → status=OK.
     - Nếu KHÔNG tìm thấy Photoshop → giữ READY, thêm error mô tả.
     - Nếu export lỗi → status=ERROR + error chi tiết.
-    - Nếu upload Drive lỗi → status vẫn OK nhưng thêm it['drive_error'] để bạn biết.
     """
     if not isinstance(items, list):
         return items
 
-    exe = _find_photoshop_exe(ps_exe)
-    if not exe:
+    # Khởi Photoshop bridge 1 lần cho cả batch (giảm overhead khởi động)
+    try:
+        bridge = _PhotoshopBridge(ps_exe=ps_exe, use_com=USE_PS_COM)
+    except Exception as e:
         for it in items:
             if it.get("status") == "READY":
                 it.setdefault("error", None)
                 if not it["error"]:
-                    it["error"] = "Photoshop chưa cấu hình — bỏ qua bước render."
+                    it["error"] = f"Photoshop chưa cấu hình — {e}"
         return items
 
-    # Chuẩn bị Drive service 1 lần (nếu có item cần upload)
-    drive_service = None
-    drive_folder_id = None
+    # Cho phép bật/tắt skip nếu đã có trên Drive (ENV: SKIP_IF_EXISTS_ON_DRIVE=0 để tắt)
+    SKIP_IF_EXISTS_ON_DRIVE = os.environ.get("SKIP_IF_EXISTS_ON_DRIVE", "1") != "0"
+
+    # Chuẩn bị context Drive (service + folder ngày) MỘT LẦN (nhưng CHECK TỪNG FILE như cũ)
+    drive_ctx = None  # (service, day_id)
+    if SKIP_IF_EXISTS_ON_DRIVE:
+        try:
+            service = dsync._get_drive_service()
+            root_id = dsync._ensure_drive_folder(service, getattr(dsync, "DRIVE_FOLDER_NAME", DRIVE_FOLDER_NAME_ENV))
+            day_id  = dsync._ensure_child_folder(service, root_id, dsync._today_folder_name())
+            drive_ctx = (service, day_id)
+        except Exception as e:
+            print(f"[BATCH][WARN] Drive check disabled (reason: {e})")
+            drive_ctx = None
+
+    t_end = time.time() + timeout
 
     for it in items:
         if it.get("status") != "READY":
@@ -325,30 +357,34 @@ def relink_and_export_batch(items: List[Dict], ps_exe: Optional[str] = None, tim
             it["error"]  = "Thiếu đường dẫn psd/img/output."
             continue
 
-        # Ép .png và cập nhật lại vào item
-        outp_png = _force_png_path(outp)
-        it["output_path"] = outp_png
+        outp_jpg = _force_jpg_path(outp)
+        it["output_path"] = outp_jpg
+
+        # BỎ QUA nếu file trùng tên đã tồn tại trên Drive (THƯ MỤC NGÀY) — kiểm tra TỪNG FILE như cũ
+        if drive_ctx is not None:
+            try:
+                service, day_id = drive_ctx
+                filename = Path(outp_jpg).name
+                existing_id = dsync._file_exists_in_folder(service, day_id, filename)
+                if existing_id:
+                    it["status"] = "SKIPPED"
+                    it["error"]  = f"Exists on Drive (file_id={existing_id})"
+                    continue
+            except Exception as e:
+                # Nếu check lỗi, cảnh báo rồi vẫn render bình thường
+                print(f"[BATCH][WARN] Drive exists check failed for {outp_jpg}: {e}")
+
+        # Kiểm tra timeout tổng (batch)
+        if time.time() > t_end:
+            it["status"] = "ERROR"
+            it["error"]  = "Batch timeout."
+            continue
 
         try:
-            ok, err = _relink_and_export_single(exe, psd, img, outp_png, timeout=timeout)
+            ok, err = bridge.relink_and_export(psd, img, outp_jpg, timeout=SINGLE_TIMEOUT)
             if ok:
                 it["status"] = "OK"
                 it["error"]  = None
-
-                # ---- Upload lên Google Drive/{DRIVE_FOLDER_NAME_ENV} ----  <-- CHANGED
-                try:
-                    if drive_service is None:
-                        drive_service = _get_drive_service()
-                        drive_folder_id = _ensure_drive_folder(drive_service, DRIVE_FOLDER_NAME_ENV)
-
-                    # Tên file trên Drive = đúng tên output hiện tại (basename)
-                    filename = Path(outp_png).name  # <-- CHANGED (đúng yêu cầu)
-                    up = _upload_file_to_folder(drive_service, outp_png, filename, drive_folder_id)
-                    it["drive_file_id"] = up.get("id")
-                    it["drive_url"] = up.get("link") or (f"https://drive.google.com/file/d/{up.get('id')}/view" if up.get("id") else None)
-                except Exception as up_err:
-                    it["drive_error"] = str(up_err)
-
             else:
                 it["status"] = "ERROR"
                 it["error"]  = err or "Export failed."
@@ -356,7 +392,7 @@ def relink_and_export_batch(items: List[Dict], ps_exe: Optional[str] = None, tim
             it["status"] = "ERROR"
             it["error"]  = str(e)
         finally:
-            # Xoá ảnh tạm nếu có
+            # Dọn ảnh tạm nếu có
             if it.get("_tmp_img") and isinstance(img, str) and os.path.isfile(img):
                 try: os.remove(img)
                 except Exception: pass

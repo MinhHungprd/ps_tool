@@ -2,6 +2,7 @@
 import os, json, time, mimetypes
 from pathlib import Path
 from typing import Optional, Dict, List, Tuple
+from datetime import datetime
 
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
@@ -77,38 +78,105 @@ def _ensure_drive_folder(service, folder_name: str) -> str:
     folder = service.files().create(body=meta, fields="id").execute()
     return folder["id"]
 
+def _ensure_child_folder(service, parent_id: str, child_name: str) -> str:
+    """Tạo/tìm folder con trong parent cụ thể."""
+    safe = child_name.replace("'", "\\'")
+    q = (
+        f"name = '{safe}' and mimeType = 'application/vnd.google-apps.folder' "
+        f"and trashed = false and '{parent_id}' in parents"
+    )
+    res = service.files().list(q=q, spaces="drive", fields="files(id,name)", pageSize=1).execute()
+    files = res.get("files", [])
+    if files:
+        return files[0]["id"]
+    meta = {
+        "name": child_name,
+        "mimeType": "application/vnd.google-apps.folder",
+        "parents": [parent_id],
+    }
+    folder = service.files().create(body=meta, fields="id").execute()
+    return folder["id"]
+
 def _upload_file_to_folder(service, file_path: Path, folder_id: str) -> Dict[str, str]:
-    mime, _ = mimetypes.guess_type(str(file_path))
-    if not mime:
-        mime = "application/octet-stream"
+    # Chỉ cho phép .jpg — đảm bảo mime chính xác
+    mime = "image/jpg"
     media = MediaFileUpload(str(file_path), mimetype=mime, resumable=False)
     body = {"name": file_path.name, "parents": [folder_id]}
     f = service.files().create(body=body, media_body=media, fields="id,webViewLink").execute()
     return {"id": f.get("id"), "link": f.get("webViewLink")}
 
+def _today_folder_name() -> str:
+    """
+    Tên thư mục ngày theo yêu cầu: DD_MM_YY.
+    Ví dụ: 12/10/2025 -> '12_10_25'
+    """
+    now = datetime.now()  # dùng local time của server/VPS
+    return now.strftime("%d_%m_%y")
+
+def _file_exists_in_folder(service, folder_id: str, filename: str) -> Optional[str]:
+    """
+    Kiểm tra xem trong folder_id đã tồn tại file tên filename chưa.
+    Trả về file_id nếu có, None nếu chưa có.
+    """
+    safe = filename.replace("'", "\\'")
+    q = (
+        f"name = '{safe}' and trashed = false and '{folder_id}' in parents"
+    )
+    res = service.files().list(
+        q=q, spaces="drive", fields="files(id,name)", pageSize=1
+    ).execute()
+    files = res.get("files", [])
+    if files:
+        return files[0]["id"]
+    return None
+
+
 def sync_outputs_to_drive(delete_local: bool = True) -> List[Tuple[str, Optional[str], Optional[str]]]:
     """
-    Upload tất cả file trong storage/outputs lên Drive/{DRIVE_FOLDER_NAME},
+    Upload tất cả file jpg trong storage/outputs lên Drive/{DRIVE_FOLDER_NAME}/{DD_MM_YY},
     nếu upload OK thì xoá file local.
-    Trả về list các tuple (filename, file_id, link) — file_id/link là None nếu thất bại.
+    Trả về list (filename, file_id, link) — file_id/link là None nếu thất bại hoặc bị bỏ qua.
     """
     if not OUTPUT_DIR.is_dir():
         print(f"[SYNC] OUTPUT_DIR not found: {OUTPUT_DIR}")
         return []
 
-    files = [p for p in OUTPUT_DIR.iterdir() if p.is_file() and not p.name.endswith((".ok", ".err"))]
+    # Chỉ lấy .jpg và bỏ qua cờ .ok/.err
+    files = [
+        p for p in OUTPUT_DIR.iterdir()
+        if p.is_file()
+        and p.suffix.lower() == ".jpg"
+        and not p.name.endswith((".ok", ".err"))
+    ]
     if not files:
-        print("[SYNC] No files to upload.")
+        print("[SYNC] No JPG files to upload.")
         return []
 
     service = _get_drive_service()
-    folder_id = _ensure_drive_folder(service, DRIVE_FOLDER_NAME)
+
+    # Tạo/tham chiếu thư mục gốc (DRIVE_FOLDER_NAME) và thư mục ngày (DD_MM_YY)
+    root_id = _ensure_drive_folder(service, DRIVE_FOLDER_NAME)
+    day_folder = _today_folder_name()
+    day_id = _ensure_child_folder(service, root_id, day_folder)
 
     results: List[Tuple[str, Optional[str], Optional[str]]] = []
     for p in files:
         try:
-            print(f"[SYNC] Uploading: {p.name}")
-            up = _upload_file_to_folder(service, p, folder_id)
+            # Kiểm tra tồn tại trước khi upload
+            existing_id = _file_exists_in_folder(service, day_id, p.name)
+            if existing_id:
+                print(f"[SYNC] Skip {p.name} (already exists on Drive)")
+                results.append((p.name, existing_id, None))
+                if delete_local:
+                    try:
+                        p.unlink()
+                        print(f"[SYNC] Deleted local (duplicate): {p.name}")
+                    except Exception as e:
+                        print(f"[SYNC][WARN] Delete failed: {p.name} -> {e}")
+                continue
+
+            print(f"[SYNC] Uploading: {p.name} -> {DRIVE_FOLDER_NAME}/{day_folder}")
+            up = _upload_file_to_folder(service, p, day_id)
             fid, link = up.get("id"), up.get("link")
             results.append((p.name, fid, link))
             if delete_local and fid:
@@ -121,4 +189,6 @@ def sync_outputs_to_drive(delete_local: bool = True) -> List[Tuple[str, Optional
             print(f"[SYNC][ERROR] Upload failed: {p.name} -> {e}")
             results.append((p.name, None, None))
             # không xoá nếu upload fail
+
     return results
+

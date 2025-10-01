@@ -1,0 +1,12 @@
+{
+  "access_token": "ya29.a0AQQ_BDQRgSJSEM4R4iVPEm9xZpt2ffNBr2WZ0n64nXnhm8q6fr1K3WHVXoK_c9xW0PV7WFdxned5HrMuBmvKMmKC52EfWlfQ8QKZTQwm9mTqW_3aoQcxiFXz1J9MsF07BhgO1CGrIfAO7ymY2YcWYeJ1pCIfDGG2QBI4ohcvmzygMTiTVlRU2oa7XZXnveUlxe5YXd0aCgYKASsSARESFQHGX2Miw_YDzeZ37ZmuvdFDkGlmhQ0206",
+  "refresh_token": "1//0gdTXFRjB_44xCgYIARAAGBASNwF-L9IrqGrRlP8urLU7XmenI61shHoXdWYtqSdcZgN-ThAONCFO2iB_GsqgqUOQxV3VrDRxSZ8",
+  "expiry": "2025-10-01T15:50:55",
+  "created_at": 1759330255,
+  "scope": [
+    "https://www.googleapis.com/auth/drive.file"
+  ],
+  "client_id": "127073868705-t8uqa2hphdhvtfs4t01vkli587hvjpo1.apps.googleusercontent.com",
+  "client_secret": "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",
+  "token_uri": "https://oauth2.googleapis.com/token"
+}

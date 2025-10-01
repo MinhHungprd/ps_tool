@@ -4,9 +4,6 @@
 
 {% block content %}
 <h1 class="mb-3 fw-bold">Xử lý đơn hàng tự động</h1>
-
-<h1 class="mb-3 fw-bold">Xử lý đơn hàng tự động</h1>
-
 {% if drive_connected %}
   <div class="alert alert-success d-flex align-items-center gap-2">
     <span class="me-2">✔️ Đã kết nối Google Drive</span>
@@ -30,44 +27,44 @@
   </div>
 
   <div class="row g-3">
-    <div class="col-sm-4">
+    <div class="col-sm-3">
       <label class="form-label" for="limit">Giới hạn số đơn xử lý</label>
-      <input type="number" min="1" value="2" class="form-control" id="limit" name="limit" />
+      <input type="number" min="1" value="30" class="form-control" id="limit" name="limit" />
     </div>
-    <div class="col-sm-4">
+    <div class="col-sm-3">
       <label class="form-label" for="sheet">Tên sheet (tùy chọn)</label>
       <input type="text" class="form-control" id="sheet" name="sheet" value="data" />
     </div>
-    <div class="col-sm-4 d-flex align-items-end">
+    <div class="col-sm-3">
+      <label class="form-label" for="batch">Số đơn mỗi lô (batch)</label>
+      <input type="number" min="1" value="5" class="form-control" id="batch" name="batch" />
+    </div>
+    <div class="col-sm-3">
+      <label class="form-label" for="report_every">Báo trạng thái mỗi n lô</label>
+      <input type="number" min="1" value="2" class="form-control" id="report_every" name="report_every" />
+    </div>
+    <div class="col-sm-12 d-flex align-items-end">
       <button type="submit" class="btn btn-primary w-100">Bắt đầu xử lý</button>
     </div>
   </div>
 </form>
 
 <div id="results" class="mt-4"></div>
-{% endblock %}
 
-{% block scripts %}
 <script>
 const form = document.getElementById("order-form");
 const resultsEl = document.getElementById("results");
 
-function renderItems(items) {
-  if (!items?.length) return `<div class="alert alert-warning">Không có kết quả.</div>`;
-  const rows = items.map((it, i) => `
-    <tr>
-      <td>${i + 1}</td>
-      <td>${it.order_id ?? ""}</td>
-      <td>${it.template ?? ""}</td>
-      <td>${it.output_path ?? ""}</td>
-      <td>${it.status ?? ""}</td>
-      <td>${it.error ?? ""}</td>
-    </tr>
-  `).join("");
-  return `
+function ensureTable() {
+  if (document.getElementById("result-body")) return;
+  resultsEl.innerHTML = `
     <div class="card">
       <div class="card-body">
-        <h5 class="card-title mb-3">Kết quả</h5>
+        <div class="d-flex align-items-center mb-3">
+          <h5 class="card-title mb-0">Kết quả</h5>
+          <span id="progress-badge" class="badge text-bg-info ms-3">0/0</span>
+          <span id="batch-badge" class="badge text-bg-secondary ms-2">Batch: 0</span>
+        </div>
         <div class="table-responsive">
           <table class="table table-striped align-middle">
             <thead>
@@ -80,29 +77,87 @@ function renderItems(items) {
                 <th>Lỗi</th>
               </tr>
             </thead>
-            <tbody>${rows}</tbody>
+            <tbody id="result-body"></tbody>
           </table>
         </div>
       </div>
     </div>
   `;
 }
+function setProgress(done, total, batchCount) {
+  const pb = document.getElementById("progress-badge");
+  const bb = document.getElementById("batch-badge");
+  if (pb) pb.textContent = `${done}/${total}`;
+  if (bb) bb.textContent = `Batch: ${batchCount ?? 0}`;
+}
+function appendRows(items) {
+  const tbody = document.getElementById("result-body");
+  if (!tbody) return;
+  for (const it of items) {
+    const idx = tbody.children.length + 1;
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td>${idx}</td>
+      <td>${it.order_id ?? ""}</td>
+      <td>${it.template ?? ""}</td>
+      <td>${it.output_path ?? ""}</td>
+      <td>${it.status ?? ""}</td>
+      <td>${it.error ?? ""}</td>
+    `;
+    tbody.appendChild(tr);
+  }
+}
 
 form.addEventListener("submit", async (e) => {
   e.preventDefault();
-  resultsEl.innerHTML = `<div class="alert alert-info">Đang xử lý...</div>`;
+  resultsEl.innerHTML = `<div class="alert alert-info">Đang xử lý…</div>`;
+  ensureTable();
+  setProgress(0, 0, 0);
+
   const fd = new FormData(form);
   try {
     const res = await fetch(window.location.href, { method: "POST", body: fd });
-    const ok = res.ok;
-    let payload = null;
-    try { payload = await res.json(); } catch { payload = null; }
-    if (!ok) throw new Error("Request failed");
-    const items = Array.isArray(payload) ? payload : (payload?.items || []);
-    resultsEl.innerHTML = renderItems(items);
+    if (!res.ok || !res.body) throw new Error("Request failed");
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder("utf-8");
+    let buf = "";
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+
+      const lines = buf.split("\n");
+      buf = lines.pop() || "";
+
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        let msg = null;
+        try { msg = JSON.parse(line); } catch { continue; }
+
+        if (msg.type === "start") {
+          setProgress(0, msg.total ?? 0, 0);
+        } else if (msg.type === "progress") {
+          // Mốc QUAN TRỌNG: chỉ đẩy sau mỗi n batch
+          const last = Array.isArray(msg.last_batches) ? msg.last_batches : [];
+          appendRows(last);
+          setProgress(msg.done ?? 0, msg.total ?? 0, msg.batch_count ?? 0);
+        } else if (msg.type === "upload_error") {
+          console.warn("Upload error:", msg.message);
+        } else if (msg.type === "error") {
+          resultsEl.insertAdjacentHTML("afterbegin",
+            `<div class="alert alert-danger">Lỗi: ${msg.message}</div>`);
+        } else if (msg.type === "done") {
+          // tuỳ chọn: nếu muốn render lại toàn bộ
+          // resultsEl.innerHTML = renderItems(msg.items || []);
+        }
+      }
+    }
   } catch (err) {
     resultsEl.innerHTML = `<div class="alert alert-danger">Lỗi: ${err.message}</div>`;
   }
 });
 </script>
+
 {% endblock %}

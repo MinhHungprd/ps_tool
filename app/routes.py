@@ -1,6 +1,7 @@
 # app/routes.py
 from flask import Blueprint, request, render_template, jsonify, abort, redirect, url_for, session
-import os, shutil
+import os, shutil, secrets
+from pathlib import Path
 import json, time
 from google_auth_oauthlib.flow import Flow
 
@@ -33,8 +34,8 @@ def _fs_sanitize(name: str) -> str:
 @login_required
 def index():
     """
-    GET  -> render templates/index.html (full page lần đầu)
-    POST -> GIỮ NGUYÊN LOGIC CŨ
+    GET  -> render templates/index.html
+    POST -> Stream NDJSON: xử lý theo batch_size, và cứ mỗi report_every batch thì xuất trạng thái.
     """
     if request.method == 'POST':
         excel_file = request.files.get('excel_file')
@@ -45,40 +46,201 @@ def index():
         saved_path = os.path.join('storage', excel_file.filename)
         excel_file.save(saved_path)
 
-        payload = []
+        # Lấy form params
+        sheet = request.form.get('sheet') or 'data'
+        limit_raw = request.form.get('limit')
+        limit = int(limit_raw) if (limit_raw and str(limit_raw).isdigit()) else None
+
+        batch_raw = request.form.get('batch')
         try:
+            batch_size = int(batch_raw) if batch_raw else 5
+            if batch_size <= 0:
+                batch_size = 5
+        except Exception:
+            batch_size = 5
+
+        report_raw = request.form.get('report_every')
+        try:
+            report_every = int(report_raw) if report_raw else 1
+            if report_every <= 0:
+                report_every = 1
+        except Exception:
+            report_every = 1
+
+        # Import deps
+        try:
+            from app.services.order_processor import process_order_from_excel
+        except Exception:
+            process_order_from_excel = None
+        try:
+            from app.services.psd_handler import relink_and_export_batch
+        except Exception:
+            relink_and_export_batch = None
+        try:
+            from app.services.drive_sync import sync_outputs_to_drive
+        except Exception:
+            sync_outputs_to_drive = None
+
+        import json, time
+        from flask import Response, stream_with_context
+
+        def _jsonline(obj: dict) -> str:
+            return json.dumps(obj, ensure_ascii=False) + "\n"
+        
+        def _safe_unlink(p: str) -> bool:
             try:
-                from app.services.order_processor import process_order_from_excel
+                if p and os.path.isfile(p):
+                    os.remove(p)
+                    return True
             except Exception:
-                process_order_from_excel = None
+                pass
+            return False
+
+        def _cleanup_tmp_leftovers(job: list, tmp_dir: str = "storage/tmp") -> int:
+            """
+            Xóa ảnh tạm còn sót:
+            - Xóa mọi _tmp_img của các item trong job nếu file vẫn còn.
+            - Xóa các file lẻ trong tmp_dir mà không thuộc _tmp_img của job.
+            Trả về tổng số file đã xóa.
+            """
+            removed = 0
+            # 1) gom danh sách tmp của job
+            job_tmp = set()
+            for it in (job or []):
+                p = it.get("_tmp_img")
+                if isinstance(p, str) and p:
+                    job_tmp.add(os.path.abspath(p))
+
+            # 2) xóa _tmp_img còn tồn tại
+            for p in list(job_tmp):
+                removed += 1 if _safe_unlink(p) else 0
+
+            # 3) xóa file lẻ trong storage/tmp
             try:
-                from app.services.psd_handler import relink_and_export_batch
+                abs_tmp = os.path.abspath(tmp_dir)
+                if os.path.isdir(abs_tmp):
+                    for name in os.listdir(abs_tmp):
+                        full = os.path.abspath(os.path.join(abs_tmp, name))
+                        # bỏ qua nếu nằm trong job_tmp (đã xử lý ở trên)
+                        if full in job_tmp:
+                            continue
+                        # chỉ xóa file, không đụng folder
+                        if os.path.isfile(full):
+                            removed += 1 if _safe_unlink(full) else 0
             except Exception:
-                relink_and_export_batch = None
+                pass
+
+            return removed
+
+        def gen():
+            # primer: buộc proxy/browser nhả stream ngay
+            yield (" " * 2048) + "\n"
             try:
-                from app.services.drive_sync import sync_outputs_to_drive
-            except Exception:
-                sync_outputs_to_drive = None
+                if not process_order_from_excel:
+                    yield _jsonline({"type": "error", "message": "Thiếu process_order_from_excel"})
+                    return
 
-            sheet = request.form.get('sheet') or 'data'
-            limit_raw = request.form.get('limit')
-            limit = int(limit_raw) if (limit_raw and limit_raw.isdigit()) else None
+                job = process_order_from_excel(saved_path, sheet=sheet, limit=limit)  # list[dict]
+                total = len(job) if job else 0
+                yield _jsonline({"type": "start", "total": total, "batch_size": batch_size, "report_every": report_every})
 
-            if process_order_from_excel:
-                job = process_order_from_excel(saved_path, sheet=sheet, limit=limit)
-                if relink_and_export_batch:
-                    relink_and_export_batch(job)
-                    sync_outputs_to_drive(delete_local=True)
+                if not job or not relink_and_export_batch:
+                    yield _jsonline({"type": "done", "items": job or []})
+                    return
 
-                payload = job
-            else:
-                payload = []
-        except Exception as e:
-            return jsonify({"error": str(e)}), 500
+                done = 0
+                batch_count = 0
+                pending_report_items = []   # gom kết quả các lô chờ report
+                processed_since_last_upload = 0
 
-        return jsonify(payload)
+                # Chia theo lô
+                for start in range(0, total, batch_size):
+                    chunk = job[start:start + batch_size]
+                    updated = relink_and_export_batch(chunk) or []
 
-    return render_template('index.html', drive_connected=(session.get("drive_connected") or _has_drive_connection())) # full page
+                    # ghi kết quả ngược lại vào job + gom phần cần report
+                    for i, it2 in enumerate(updated):
+                        job_idx = start + i
+                        if job_idx < len(job):
+                            job[job_idx] = it2
+                        pending_report_items.append(it2)
+
+                    # cập nhật đếm
+                    done += len(updated)
+                    batch_count += 1
+                    processed_since_last_upload += len(updated)
+
+                    # sau mỗi lô: có thể upload ngay (tuỳ bạn, để true để an toàn)
+                    if sync_outputs_to_drive:
+                        try:
+                            sync_outputs_to_drive(delete_local=True, user=session.get('user'))
+                        except Exception as e:
+                            yield _jsonline({"type":"upload_error","message":str(e)})
+
+                    # khi đủ n lô, xuất trạng thái
+                    if batch_count % report_every == 0:
+                        yield _jsonline({
+                            "type": "progress",
+                            "done": done,
+                            "total": total,
+                            "batch_count": batch_count,
+                            "last_batches": [  # gửi gọn những item của n lô vừa rồi
+                                {
+                                    "order_id": it.get("order_id"),
+                                    "template": it.get("template"),
+                                    "output_path": it.get("output_path"),
+                                    "status": it.get("status"),
+                                    "error": it.get("error"),
+                                } for it in pending_report_items
+                            ]
+                        })
+                        pending_report_items.clear()
+
+                    # nhả nhịp nhỏ để flush
+                    time.sleep(0.001)
+
+                # report phần còn lại nếu chưa đủ n lô để report
+                if pending_report_items:
+                    yield _jsonline({
+                        "type": "progress",
+                        "done": done,
+                        "total": total,
+                        "batch_count": batch_count,
+                        "last_batches": [
+                            {
+                                "order_id": it.get("order_id"),
+                                "template": it.get("template"),
+                                "output_path": it.get("output_path"),
+                                "status": it.get("status"),
+                                "error": it.get("error"),
+                            } for it in pending_report_items
+                        ]
+                    })
+                    pending_report_items.clear()
+
+                # Kết thúc
+                yield _jsonline({"type": "done", "items": job})
+                
+                try:
+                    removed = _cleanup_tmp_leftovers(job, tmp_dir="storage/tmp")
+                    yield _jsonline({"type": "tmp_cleanup", "removed": int(removed)})
+                except Exception as e:
+                    yield _jsonline({"type": "tmp_cleanup_error", "message": str(e)})
+
+            except Exception as e:
+                yield _jsonline({"type": "error", "message": str(e)})
+
+        headers = {
+            "Content-Type": "application/x-ndjson; charset=utf-8",
+            "Cache-Control": "no-cache, no-transform",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        }
+        return Response(stream_with_context(gen()), headers=headers)  # bỏ direct_passthrough
+
+    # GET → render trang
+    return render_template('index.html',drive_connected=(session.get("drive_connected") or _has_drive_connection(username=session.get('user'))) )
+
 
 # -------------------- (2) TEMPLATE MANAGER --------------------
 TPL_ROOT = os.path.join('storage', 'templates')
@@ -229,12 +391,15 @@ def template_rename():
         return jsonify({"error": "Đổi tên thất bại"}), 500
     
 
-# ==== GOOGLE DRIVE OAUTH + LƯU TOKEN BỀN VỮNG ====
+# ==== GOOGLE DRIVE OAUTH (per-user) + LƯU TOKEN BỀN VỮNG ====
 # Cho phép HTTP khi dev
 os.environ.setdefault("OAUTHLIB_INSECURE_TRANSPORT", "1")
 
 REDIRECT_URI = os.getenv("OAUTH_REDIRECT_URI", "http://localhost:5000/oauth2/callback")
-TOKEN_DB = os.path.join("storage/driveSession", "drive_tokens.json")
+TOKEN_DIR = Path(os.environ.get("DRIVE_TOKEN_DIR", "storage/driveSession"))
+TOKEN_DIR.mkdir(parents=True, exist_ok=True)
+
+SCOPES = ["https://www.googleapis.com/auth/drive.file"]
 
 def _client_config():
     return {
@@ -247,50 +412,62 @@ def _client_config():
         }
     }
 
-def _load_tokens():
-    try:
-        if os.path.isfile(TOKEN_DB):
-            with open(TOKEN_DB, "r", encoding="utf-8") as f:
-                return json.load(f)
-    except Exception:
-        pass
+def _sanitize_user(u: str) -> str:
+    return "".join(ch for ch in u if ch.isalnum() or ch in ("-", "_", ".")).strip() or "unknown"
+
+def _user_token_path(username: str) -> Path:
+    return TOKEN_DIR / f"drive_token_{_sanitize_user(username)}.json"
+
+def _load_user_tokens(username: str):
+    p = _user_token_path(username)
+    if p.is_file():
+        try:
+            return json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            return None
     return None
 
-def _save_tokens(creds):
-    os.makedirs("storage", exist_ok=True)
+def _save_user_tokens(username: str, creds):
+    p = _user_token_path(username)
+    p.parent.mkdir(parents=True, exist_ok=True)
     data = {
         "access_token": getattr(creds, "token", None),
         "refresh_token": getattr(creds, "refresh_token", None),
         "expiry": getattr(creds, "expiry", None).isoformat() if getattr(creds, "expiry", None) else None,
         "created_at": int(time.time()),
         "scope": getattr(creds, "scopes", None),
+        # Lưu kèm client để drive_sync có thể rebuild Credentials
+        "client_id": os.getenv("GOOGLE_CLIENT_ID"),
+        "client_secret": os.getenv("GOOGLE_CLIENT_SECRET"),
+        "token_uri": "https://oauth2.googleapis.com/token",
     }
-    with open(TOKEN_DB, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
-def _has_drive_connection():
-    tok = _load_tokens()
+def _has_drive_connection(username: str) -> bool:
+    tok = _load_user_tokens(username)
     return bool(tok and tok.get("refresh_token"))
 
 @main.route("/connect-drive")
 @login_required
 def connect_drive():
-    flow = Flow.from_client_config(
-        _client_config(),
-        scopes=[
-            "https://www.googleapis.com/auth/drive.file",
-            # (không bắt buộc) Nếu muốn lấy email user sau này:
-            # "openid", "https://www.googleapis.com/auth/userinfo.email"
-        ],
-    )
+    username = session.get("user")
+    if not username:
+        return redirect(url_for("auth.login", next=request.path))
+
+    flow = Flow.from_client_config(_client_config(), scopes=SCOPES)
     flow.redirect_uri = REDIRECT_URI
 
-    authorization_url, state = flow.authorization_url(
+    # Gắn state gồm user + nonce để xác thực callback
+    nonce = secrets.token_urlsafe(16)
+    state = f"user={_sanitize_user(username)};nonce={nonce}"
+    session["oauth_state"] = state
+
+    authorization_url, _ = flow.authorization_url(
         access_type="offline",
         prompt="consent",
         include_granted_scopes="true",
+        state=state,
     )
-    session["oauth_state"] = state
     print("[OAUTH] redirect_uri =", flow.redirect_uri)
     print("[OAUTH] auth_url     =", authorization_url)
     return redirect(authorization_url)
@@ -298,18 +475,27 @@ def connect_drive():
 @main.route("/oauth2/callback")
 @login_required
 def oauth2_callback():
+    username = session.get("user")
+    if not username:
+        return redirect(url_for("auth.login"))
+
     try:
-        flow = Flow.from_client_config(
-            _client_config(),
-            scopes=["https://www.googleapis.com/auth/drive.file"],
-            state=session.get("oauth_state"),
-        )
+        # Xác thực state
+        state_client = request.args.get("state") or ""
+        state_session = session.get("oauth_state") or ""
+        if not state_client or state_client != state_session:
+            return "OAuth state mismatch.", 400
+
+        flow = Flow.from_client_config(_client_config(), scopes=SCOPES, state=state_client)
         flow.redirect_uri = REDIRECT_URI
         flow.fetch_token(authorization_response=request.url)
+
         creds = flow.credentials
-        _save_tokens(creds)
-        session["drive_connected"] = True
-        print("[OAUTH] connected; has_refresh_token:", bool(getattr(creds, "refresh_token", None)))
+        _save_user_tokens(username, creds)
+        session["drive_connected"] = True  # chỉ để hiển thị UI
+
+        print(f"[OAUTH] connected for user={username}; has_refresh_token:",
+              bool(getattr(creds, "refresh_token", None)))
         return redirect(url_for("main.index"))
     except Exception as e:
         import traceback; traceback.print_exc()
@@ -318,14 +504,15 @@ def oauth2_callback():
 @main.route("/disconnect-drive")
 @login_required
 def disconnect_drive():
+    username = session.get("user")
     try:
-        if os.path.exists(TOKEN_DB):
-            os.remove(TOKEN_DB)
+        p = _user_token_path(username) if username else None
+        if p and p.exists():
+            p.unlink()
     except Exception:
         pass
     session.pop("drive_connected", None)
     return redirect(url_for("main.index"))
-
 
 
 
