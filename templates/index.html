@@ -4,6 +4,9 @@
 
 {% block content %}
 <h1 class="mb-3 fw-bold">Xử lý đơn hàng tự động</h1>
+
+<!-- (ẨN UI Drive cũ — giữ lại nếu muốn, nhưng comment để vô hiệu) -->
+{# 
 {% if drive_connected %}
   <div class="alert alert-success d-flex align-items-center gap-2">
     <span class="me-2">✔️ Đã kết nối Google Drive</span>
@@ -18,7 +21,20 @@
     </a>
   </div>
 {% endif %}
+#}
 
+<!-- CHỌN THƯ MỤC LƯU TRỮ LOCAL -->
+<div class="card mb-3">
+  <div class="card-body">
+    <label class="form-label fw-semibold">Thư mục lưu trữ trên máy chủ (local)</label>
+    <div class="input-group">
+      <input type="text" class="form-control" id="local_dest" placeholder="Ví dụ: D:\EXPORTS hoặc /home/ubuntu/exports" value="{{ local_dest or '' }}">
+      <button class="btn btn-outline-secondary" id="btn-save-dest">Lưu</button>
+    </div>
+    <div class="form-text">Ảnh kết quả sẽ được lưu vào: <code>&lt;thư_mục_đã_chọn&gt;/DD_MM_YY/tên_file.jpg</code></div>
+    <div id="dest-status" class="mt-2"></div>
+  </div>
+</div>
 
 <form id="order-form" method="POST" enctype="multipart/form-data" class="card p-3 p-md-4">
   <div class="mb-3">
@@ -43,9 +59,14 @@
       <label class="form-label" for="report_every">Báo trạng thái mỗi n lô</label>
       <input type="number" min="1" value="2" class="form-control" id="report_every" name="report_every" />
     </div>
-    <div class="col-sm-12 d-flex align-items-end">
-      <button type="submit" class="btn btn-primary w-100">Bắt đầu xử lý</button>
-    </div>
+  </div>
+
+  <div class="d-flex align-items-center gap-2 mt-3">
+    <button type="button" id="btn-start-stop" class="btn btn-primary">
+      <span class="spinner-border spinner-border-sm me-2 d-none" id="spinner" role="status" aria-hidden="true"></span>
+      <span id="btn-label">Bắt đầu xử lý</span>
+    </button>
+    <span id="guard-msg" class="text-danger small d-none">⚠️ Chưa chọn thư mục lưu trữ local.</span>
   </div>
 </form>
 
@@ -54,6 +75,73 @@
 <script>
 const form = document.getElementById("order-form");
 const resultsEl = document.getElementById("results");
+const btnStartStop = document.getElementById("btn-start-stop");
+const spinner = document.getElementById("spinner");
+const btnLabel = document.getElementById("btn-label");
+const guardMsg = document.getElementById("guard-msg");
+const destInput = document.getElementById("local_dest");
+const destStatus = document.getElementById("dest-status");
+const btnSaveDest = document.getElementById("btn-save-dest");
+
+let running = false;
+let controller = null; // AbortController cho fetch
+
+async function loadDest() {
+  try {
+    const res = await fetch("/api/local-dest");
+    const data = await res.json();
+    const p = data.path || "";
+    if (!destInput.value) destInput.value = p;
+    updateGuard();
+    showDestStatus(!!p, p);
+  } catch {}
+}
+
+function showDestStatus(ok, p) {
+  if (ok && p) {
+    destStatus.innerHTML = `<div class="text-success">✔️ Đang lưu về: <code>${p}</code></div>`;
+  } else {
+    destStatus.innerHTML = `<div class="text-danger">⚠️ Chưa chọn thư mục lưu trữ local.</div>`;
+  }
+}
+
+function updateGuard() {
+  const hasDest = !!(destInput.value && destInput.value.trim().length > 0);
+  if (!hasDest) {
+    guardMsg.classList.remove("d-none");
+    btnStartStop.classList.add("disabled");
+  } else {
+    guardMsg.classList.add("d-none");
+    btnStartStop.classList.remove("disabled");
+  }
+}
+
+btnSaveDest.addEventListener("click", async () => {
+  const raw = (destInput.value || "").trim();
+  if (!raw) {
+    showDestStatus(false, "");
+    updateGuard();
+    return;
+  }
+  try {
+    const res = await fetch("/api/local-dest", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path: raw })
+    });
+    const data = await res.json();
+    if (data.ok) {
+      showDestStatus(true, data.path);
+      updateGuard();
+    } else {
+      destStatus.innerHTML = `<div class="text-danger">❌ ${data.error || "Không thể lưu thư mục."}</div>`;
+      updateGuard();
+    }
+  } catch (e) {
+    destStatus.innerHTML = `<div class="text-danger">❌ ${e.message}</div>`;
+    updateGuard();
+  }
+});
 
 function ensureTable() {
   if (document.getElementById("result-body")) return;
@@ -137,15 +225,48 @@ function appendRows(items) {
   }
 }
 
-form.addEventListener("submit", async (e) => {
-  e.preventDefault();
+function setRunningUI(on) {
+  running = on;
+  if (on) {
+    spinner.classList.remove("d-none");
+    btnLabel.textContent = "Đang xử lý… Nhấn để dừng";
+    btnStartStop.classList.remove("btn-primary");
+    btnStartStop.classList.add("btn-danger");
+  } else {
+    spinner.classList.add("d-none");
+    btnLabel.textContent = "Bắt đầu xử lý";
+    btnStartStop.classList.add("btn-primary");
+    btnStartStop.classList.remove("btn-danger");
+  }
+}
+
+btnStartStop.addEventListener("click", async () => {
+  // Chưa chọn thư mục thì chặn
+  if (!destInput.value || !destInput.value.trim()) {
+    guardMsg.classList.remove("d-none");
+    return;
+  } else {
+    guardMsg.classList.add("d-none");
+  }
+
+  if (running) {
+    // DỪNG: hủy fetch
+    try { controller?.abort(); } catch {}
+    setRunningUI(false);
+    return;
+  }
+
+  // BẮT ĐẦU
   resultsEl.innerHTML = `<div class="alert alert-info">Đang xử lý…</div>`;
   ensureTable();
   setProgress(0, 0, 0);
+  setRunningUI(true);
 
   const fd = new FormData(form);
+  controller = new AbortController();
+
   try {
-    const res = await fetch(window.location.href, { method: "POST", body: fd });
+    const res = await fetch(window.location.href, { method: "POST", body: fd, signal: controller.signal });
     if (!res.ok || !res.body) throw new Error("Request failed");
 
     const reader = res.body.getReader();
@@ -171,25 +292,31 @@ form.addEventListener("submit", async (e) => {
           const last = Array.isArray(msg.last_batches) ? msg.last_batches : [];
           appendRows(last);
           setProgress(msg.done ?? 0, msg.total ?? 0, msg.batch_count ?? 0, msg.timing || null);
-        } else if (msg.type === "upload_error") {
-          console.warn("Upload error:", msg.message);
         } else if (msg.type === "error") {
           resultsEl.insertAdjacentHTML("afterbegin",
             `<div class="alert alert-danger">Lỗi: ${msg.message}</div>`);
         } else if (msg.type === "done") {
-          setProgress(
-            (msg.items || []).length, (msg.items || []).length,
-            undefined,
-            msg.timing || null
-          );
+          setProgress((msg.items || []).length, (msg.items || []).length, undefined, msg.timing || null);
         } else if (msg.type === "tmp_cleanup") {
           console.log("Đã xóa ảnh tạm:", msg.removed);
         }
       }
     }
   } catch (err) {
-    resultsEl.innerHTML = `<div class="alert alert-danger">Lỗi: ${err.message}</div>`;
+    if (err.name === "AbortError") {
+      resultsEl.insertAdjacentHTML("afterbegin",
+        `<div class="alert alert-warning">Đã dừng theo yêu cầu.</div>`);
+    } else {
+      resultsEl.innerHTML = `<div class="alert alert-danger">Lỗi: ${err.message}</div>`;
+    }
+  } finally {
+    setRunningUI(false);
+    controller = null;
   }
 });
+
+destInput.addEventListener("input", updateGuard);
+updateGuard();
+loadDest();
 </script>
 {% endblock %}

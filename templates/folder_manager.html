@@ -67,18 +67,13 @@
         <button class="btn btn-sm btn-outline-primary" id="refreshBtn">Làm mới</button>
       </div>
 
+      <!-- 🔎 TÌM KIẾM MỚI: nhập loại + nhập size -->
       <div class="row g-2 mb-3">
         <div class="col-md-6">
-          <input type="text" id="search-template" class="form-control" placeholder="Tìm loại áo hoặc size..." />
+          <input type="text" id="search-type" class="form-control" placeholder="Nhập tên loại áo (để trống = tất cả loại áo)">
         </div>
-        <div class="col-md-3">
-          <select id="filter-type" class="form-select"><option value="">Tất cả loại áo</option></select>
-        </div>
-        <div class="col-md-3">
-          <select id="filter-size" class="form-select">
-            <option value="">Tất cả size</option>
-            <option>S</option><option>M</option><option>L</option><option>XL</option><option>2XL</option>
-          </select>
+        <div class="col-md-6">
+          <input type="text" id="search-size" class="form-control" placeholder="Nhập size (ví dụ: M; để trống = tất cả size)">
         </div>
       </div>
 
@@ -167,45 +162,58 @@ async function fetchTree(){
     }
     return { type: it.type, sizes: it.sizes || [] };
   });
-  populateSelectors();
+  populateUploadTypeSelect();   // chỉ còn dùng cho khối Upload
   currentPage=1;
   renderList(filterData());
 }
 
-/* ---------- Fill selects ---------- */
-function populateSelectors(){
+/* ---------- Fill select (CHỈ cho Upload) ---------- */
+function populateUploadTypeSelect(){
   const typeSel = document.getElementById('type-select');
-  const filterTypeSel = document.getElementById('filter-type');
   const uniqTypes = Array.from(new Set(allTemplates.map(x=>x.type)));
   typeSel.innerHTML = '<option value="">(Chọn loại đã có)</option>' + uniqTypes.map(t=>`<option>${t}</option>`).join('');
-  filterTypeSel.innerHTML = '<option value="">Tất cả loại áo</option>' + uniqTypes.map(t=>`<option>${t}</option>`).join('');
 }
 
-/* ---------- Filtering (accent-insensitive) ---------- */
+/* ---------- Helpers ---------- */
+function normSize(s){
+  // chuẩn size: bỏ khoảng trắng, upper (m -> M, xl -> XL, 2xl -> 2XL)
+  return (s||'').toString().trim().replace(/\s+/g,'').toUpperCase();
+}
+function isAllLike(s){
+  const k = vnKey((s||'').trim());
+  return !k || k === 'tatca' || k === 'tat ca' || k === 'all';
+}
+
+/* ---------- Filtering ---------- */
 function filterData(){
-  const qRaw = document.getElementById('search-template').value.trim();
-  const q = vnKey(qRaw);
-  const ft = document.getElementById('filter-type').value;
-  const fs = document.getElementById('filter-size').value;
+  const qTypeRaw = document.getElementById('search-type').value;
+  const qSizeRaw = document.getElementById('search-size').value;
 
-  return allTemplates.map(t => ({
-    type: t.type,
-    entries: (t.entries ? t.entries : (t.sizes||[]).map(sz=>({size:sz, filename: null})))
-      .filter(e => (!fs || e.size===fs))
-  }))
-  .filter(t=>{
-    if (ft && t.type!==ft) return false;
-    if (q){
-      const hitType = vnKey(t.type).includes(q);
-      const hitSize = t.entries.some(e=> vnKey(e.size||'').includes(q));
-      if (!hitType && !hitSize) return false;
-    }
-    if (fs && t.entries.length===0) return false;
-    return true;
-  });
+  const qType = vnKey(qTypeRaw);
+  const sizeKey = normSize(qSizeRaw);
+
+  return allTemplates
+    .map(t => {
+      // lọc theo size trước
+      const entries = (t.entries ? t.entries : (t.sizes||[]).map(sz=>({size:sz, filename: null})))
+        .filter(e => {
+          if (isAllLike(sizeKey)) return true;           // tất cả size
+          return normSize(e.size) === sizeKey;           // khớp size
+        });
+
+      return { type: t.type, entries };
+    })
+    .filter(t => {
+      // lọc theo loại áo (tên)
+      const typeOk = isAllLike(qType) || vnKey(t.type).includes(qType);
+      if (!typeOk) return false;
+      // nếu có yêu cầu size cụ thể mà loại này không có size đó ➜ loại bỏ
+      if (!isAllLike(qSizeRaw) && t.entries.length === 0) return false;
+      return true;
+    });
 }
 
-/* ---------- Render list (onclick an toàn với JSON.stringify) ---------- */
+/* ---------- Render list ---------- */
 function renderList(list){
   const start = (currentPage-1)*perPage;
   const pageItems = list.slice(start,start+perPage);
@@ -378,15 +386,13 @@ document.getElementById('tpl-upload').addEventListener('submit', async (e)=>{
   }
 });
 
-/* ---------- Filters ---------- */
+/* ---------- Filters (new) ---------- */
 function setupFilters(){
-  const search = document.getElementById('search-template');
-  const fType  = document.getElementById('filter-type');
-  const fSize  = document.getElementById('filter-size');
+  const fType  = document.getElementById('search-type');
+  const fSize  = document.getElementById('search-size');
   const onChange = ()=>{ currentPage=1; renderList(filterData()); };
-  search.addEventListener('input', onChange);
-  fType.addEventListener('change', onChange);
-  fSize.addEventListener('change', onChange);
+  fType.addEventListener('input', onChange);
+  fSize.addEventListener('input', onChange);
 }
 
 /* ---------- Init ---------- */

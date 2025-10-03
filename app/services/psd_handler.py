@@ -36,7 +36,16 @@ BATCH_TIMEOUT = int(os.getenv("BATCH_TIMEOUT", "1040"))    # giây cho batch
 TEXT_LAYER_NAME = os.getenv("TEXT_LAYER_NAME", "idsp")     # tên layer chữ cần gán (mặc định: idsp)
 
 # ========= Import drive_sync để kiểm tra trùng tên trên Drive =========
-from app.services import drive_sync as dsync
+# from app.services import drive_sync as dsync
+
+def _cleanup_flags(out_path: str) -> None:
+    for flag in (out_path + ".ok", out_path + ".err"):
+        try:
+            if os.path.isfile(flag):
+                os.remove(flag)
+        except Exception:
+            pass
+
 
 # ================== JSX để chạy trong Photoshop ==================
 JSX_TEMPLATE = r"""#target photoshop
@@ -254,13 +263,9 @@ def _find_photoshop_exe(user_path: Optional[str]) -> Optional[str]:
     return w if w and os.path.isfile(w) else None
 
 def _wait_for_result(path: str, timeout: int = SINGLE_TIMEOUT) -> Tuple[bool, Optional[str]]:
-    """
-    Chờ file output hoặc cờ .ok; nếu có .err thì trả lỗi ngay.
-    """
     t0 = time.time()
     ok_flag = path + ".ok"
     err_flag = path + ".err"
-
     while time.time() - t0 < timeout:
         if os.path.isfile(err_flag):
             try:
@@ -270,7 +275,6 @@ def _wait_for_result(path: str, timeout: int = SINGLE_TIMEOUT) -> Tuple[bool, Op
         if os.path.isfile(path) or os.path.isfile(ok_flag):
             return True, None
         time.sleep(POLL_INTERVAL)
-
     if os.path.isfile(err_flag):
         try:
             return False, Path(err_flag).read_text(encoding="utf-8", errors="ignore")
@@ -284,18 +288,11 @@ def _force_jpg_path(path: str) -> str:
         p = p.with_suffix(".jpg")
     return str(p)
 
-# ================== Photoshop Bridge (COM / Subprocess) ==================
-
 class _PhotoshopBridge:
-    """
-    Bridge 2 chế độ:
-    - COM (win32com) nếu USE_PS_COM=1 và có Photoshop COM.
-    - Subprocess photoshop.exe -r JSX nếu không có COM.
-    """
     def __init__(self, ps_exe: Optional[str] = None, use_com: bool = USE_PS_COM):
         self.mode = "subprocess"
         self.exe = _find_photoshop_exe(ps_exe)
-        self.app = None  # COM app
+        self.app = None
         if use_com:
             try:
                 import win32com.client  # type: ignore
@@ -304,7 +301,6 @@ class _PhotoshopBridge:
             except Exception as e:
                 print(f"[PS_BRIDGE] COM init failed, fallback to subprocess. Reason: {e}")
                 self.mode = "subprocess"
-
         if self.mode == "subprocess" and not self.exe:
             raise RuntimeError("Photoshop executable not found.")
 
@@ -314,9 +310,7 @@ class _PhotoshopBridge:
         out_abs = os.path.abspath(out_path).replace("\\", "/")
         os.makedirs(os.path.dirname(out_abs), exist_ok=True)
 
-        # Truyền tên layer cố định (ENV TEXT_LAYER_NAME) vào JSX
         text_layer_name = (TEXT_LAYER_NAME or "").replace('"', '\\"')
-
         jsx_code = JSX_TEMPLATE.format(
             psd=psd_abs,
             img=img_abs,
@@ -329,22 +323,19 @@ class _PhotoshopBridge:
             try:
                 self.app.DoJavaScript(jsx_code)  # type: ignore
             except Exception as e:
-                # vẫn đợi cờ .err để lấy message chi tiết
                 print(f"[PS_BRIDGE][COM] DoJavaScript error: {e}")
             ok, err = _wait_for_result(out_abs, timeout=timeout)
-            # dọn cờ
             for flag in (out_abs + ".ok", out_abs + ".err"):
                 try:
                     if os.path.isfile(flag): os.remove(flag)
                 except Exception:
                     pass
+            _cleanup_flags(out_abs)
             return ok, err
 
-        # subprocess fallback
         with tempfile.NamedTemporaryFile(prefix="ps_relink_", suffix=".jsx", delete=False) as tf:
             jsx_path = tf.name
         Path(jsx_path).write_text(jsx_code, encoding="utf-8")
-
         try:
             subprocess.Popen([self.exe, "-r", jsx_path], close_fds=True)
         except Exception as e:
@@ -353,8 +344,6 @@ class _PhotoshopBridge:
             raise RuntimeError(f"Launch Photoshop failed: {e}")
 
         ok, err = _wait_for_result(out_abs, timeout=timeout)
-
-        # dọn temp JSX + cờ
         try: os.remove(jsx_path)
         except Exception: pass
         for flag in (out_abs + ".ok", out_abs + ".err"):
@@ -363,23 +352,17 @@ class _PhotoshopBridge:
                     os.remove(flag)
             except Exception:
                 pass
-
+        _cleanup_flags(out_abs)
         return ok, err
-
-# ================== Batch pipeline ==================
 
 def relink_and_export_batch(items: List[Dict], ps_exe: Optional[str] = None, timeout: int = BATCH_TIMEOUT) -> List[Dict]:
     """
-    Nhận list items từ order_processor (status=READY):
-    - Nếu file đích đã có sẵn trên Google Drive (thư mục ngày) -> SKIPPED (kiểm tra THEO FILE như cũ).
-    - Photoshop OK → status=OK.
-    - Nếu KHÔNG tìm thấy Photoshop → giữ READY, thêm error mô tả.
-    - Nếu export lỗi → status=ERROR + error chi tiết.
+    Batch chạy Photoshop.
+    (ĐÃ BỎ phần kiểm tra "trùng tên trên Drive" để SKIP — theo yêu cầu vô hiệu hóa Drive)
     """
     if not isinstance(items, list):
         return items
 
-    # Khởi Photoshop bridge 1 lần cho cả batch (giảm overhead khởi động)
     try:
         bridge = _PhotoshopBridge(ps_exe=ps_exe, use_com=USE_PS_COM)
     except Exception as e:
@@ -389,21 +372,6 @@ def relink_and_export_batch(items: List[Dict], ps_exe: Optional[str] = None, tim
                 if not it["error"]:
                     it["error"] = f"Photoshop chưa cấu hình — {e}"
         return items
-
-    # Cho phép bật/tắt skip nếu đã có trên Drive (ENV: SKIP_IF_EXISTS_ON_DRIVE=0 để tắt)
-    SKIP_IF_EXISTS_ON_DRIVE = os.environ.get("SKIP_IF_EXISTS_ON_DRIVE", "1") != "0"
-
-    # Chuẩn bị context Drive (service + folder ngày) MỘT LẦN (nhưng CHECK TỪNG FILE như cũ)
-    drive_ctx = None  # (service, day_id)
-    if SKIP_IF_EXISTS_ON_DRIVE:
-        try:
-            service = dsync._get_drive_service()
-            root_id = dsync._ensure_drive_folder(service, getattr(dsync, "DRIVE_FOLDER_NAME", DRIVE_FOLDER_NAME_ENV))
-            day_id  = dsync._ensure_child_folder(service, root_id, dsync._today_folder_name())
-            drive_ctx = (service, day_id)
-        except Exception as e:
-            print(f"[BATCH][WARN] Drive check disabled (reason: {e})")
-            drive_ctx = None
 
     t_end = time.time() + timeout
 
@@ -423,21 +391,6 @@ def relink_and_export_batch(items: List[Dict], ps_exe: Optional[str] = None, tim
         outp_jpg = _force_jpg_path(outp)
         it["output_path"] = outp_jpg
 
-        # BỎ QUA nếu file trùng tên đã tồn tại trên Drive (THƯ MỤC NGÀY) — kiểm tra TỪNG FILE như cũ
-        if drive_ctx is not None:
-            try:
-                service, day_id = drive_ctx
-                filename = Path(outp_jpg).name
-                existing_id = dsync._file_exists_in_folder(service, day_id, filename)
-                if existing_id:
-                    it["status"] = "SKIPPED"
-                    it["error"]  = f"Exists on Drive (file_id={existing_id})"
-                    continue
-            except Exception as e:
-                # Nếu check lỗi, cảnh báo rồi vẫn render bình thường
-                print(f"[BATCH][WARN] Drive exists check failed for {outp_jpg}: {e}")
-
-        # Kiểm tra timeout tổng (batch)
         if time.time() > t_end:
             it["status"] = "ERROR"
             it["error"]  = "Batch timeout."
@@ -455,7 +408,6 @@ def relink_and_export_batch(items: List[Dict], ps_exe: Optional[str] = None, tim
             it["status"] = "ERROR"
             it["error"]  = str(e)
         finally:
-            # Dọn ảnh tạm nếu có
             if it.get("_tmp_img") and isinstance(img, str) and os.path.isfile(img):
                 try: os.remove(img)
                 except Exception: pass
