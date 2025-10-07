@@ -33,7 +33,7 @@ JPEG_QUALITY = int(os.getenv("JPEG_QUALITY", "12"))  # 0-12
 POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "0.25"))  # giây
 SINGLE_TIMEOUT = int(os.getenv("SINGLE_TIMEOUT", "540"))   # giây cho 1 output
 BATCH_TIMEOUT = int(os.getenv("BATCH_TIMEOUT", "1040"))    # giây cho batch
-TEXT_LAYER_NAME = os.getenv("TEXT_LAYER_NAME", "idsp")     # tên layer chữ cần gán (mặc định: idsp)
+TEXT_LAYER_NAME = os.getenv("TEXT_LAYER_NAME", "CODE VAT")     # tên layer chữ cần gán (mặc định: idsp)
 
 # ========= Import drive_sync để kiểm tra trùng tên trên Drive =========
 # from app.services import drive_sync as dsync
@@ -46,206 +46,221 @@ def _cleanup_flags(out_path: str) -> None:
         except Exception:
             pass
 
+# --- thêm vào đầu file ---
+def _render_curly(template: str, mapping: dict) -> str:
+    # thay thế {{ key }} -> value (không động vào {{...}} khác)
+    out = template
+    for k, v in mapping.items():
+        out = out.replace(f"{{{{ {k} }}}}", str(v))
+    return out
 
+# ================== JSX để chạy trong Photoshop ==================
 # ================== JSX để chạy trong Photoshop ==================
 JSX_TEMPLATE = r"""#target photoshop
 app.displayDialogs = DialogModes.NO;
 
 // giảm overhead UI/History
-try {{ app.preferences.numberOfHistoryStates = 2; }} catch(e) {{}}
-try {{ app.preferences.exportClipboard = false; }} catch(e) {{}}
+try { app.preferences.numberOfHistoryStates = 2; } catch(e) {}
+try { app.preferences.exportClipboard = false; } catch(e) {}
 
-var psdPath = "{psd}";
-var imgPath = "{img}";
-var outPath = "{out}";
+var psdPath = "{{ psd }}";
+var imgPath = "{{ img }}";
+var outPath = "{{ out }}";
 var okFlag  = outPath + ".ok";
 var errFlag = outPath + ".err";
-var JPEG_QUALITY = {jpeg_quality};
-var textLayerName = "{text_layer}"; // fast-path nếu đặt tên cố định
+var JPEG_QUALITY = {{ jpeg_quality }};
+var textLayerName = "{{ text_layer }}"; // fast-path nếu đặt tên cố định
 
 // ---------- Helpers ----------
-function isSmartObjectLayer(ly) {{ try {{ return ly.kind == LayerKind.SMARTOBJECT; }} catch (e) {{ return false; }} }}
-function walkAndRelinkFirstSO(container, newFile) {{
-    for (var i=0; i<container.layers.length; i++) {{
-        var ly = container.layers[i];
-        if (ly.typename === "LayerSet") {{
-            var ok = walkAndRelinkFirstSO(ly, newFile);
-            if (ok) return true;
-        }} else {{
-            if (isSmartObjectLayer(ly)) {{
-                app.activeDocument.activeLayer = ly;
-                var idplacedLayerReplaceContents = stringIDToTypeID("placedLayerReplaceContents");
-                var desc = new ActionDescriptor();
-                desc.putPath(charIDToTypeID("null"), new File(newFile));
-                executeAction(idplacedLayerReplaceContents, desc, DialogModes.NO);
-                return true;
-            }}
-        }}
-    }}
-    return false;
-}}
+function writeFlag(p, txt) {
+    try {
+        var f = new File(p);
+        f.encoding = "UTF8";
+        f.open("w"); f.write(txt); f.close();
+    } catch(e) {}
+}
+function safeLog(msg) { try { $.writeln("[JSX] " + msg); } catch(e) {} }
 
-function isTextLayer(ly) {{
-    try {{ return (ly.typename === "ArtLayer" && ly.kind === LayerKind.TEXT); }}
-    catch (e) {{ return false; }}
-}}
-function enableUnicodeComposerIfSupported(textItem) {{
-    try {{
-        if (typeof TextComposer !== "undefined" && textItem) {{
+function ensureParentFolder(pathStr) {
+    try {
+        var f = new File(pathStr);
+        var folder = f.parent;
+        if (!folder.exists) folder.create();
+    } catch(e) {}
+}
+function normalizeForRaster(doc) {
+    try { if (doc.bitsPerChannel == BitsPerChannelType.THIRTYTWO) doc.bitsPerChannel = BitsPerChannelType.SIXTEEN; } catch(e) {}
+    try { if (doc.bitsPerChannel == BitsPerChannelType.SIXTEEN)  doc.bitsPerChannel = BitsPerChannelType.EIGHT; } catch(e) {}
+    try {
+        if (doc.mode != DocumentMode.RGB &&
+            doc.mode != DocumentMode.GRAYSCALE &&
+            doc.mode != DocumentMode.INDEXEDCOLOR) {
+            doc.changeMode(ChangeMode.RGB);
+        }
+    } catch(e) {}
+}
+function saveJPEG_HQ(doc, outPath, quality) {
+    ensureParentFolder(outPath);
+    normalizeForRaster(doc);
+    try { doc.flatten(); } catch(e) {}
+    var f = new File(outPath);
+    // 1) saveAs
+    try{
+        var o = new JPEGSaveOptions();
+        o.quality = quality; // 0..12
+        o.embedColorProfile = true;
+        o.formatOptions = FormatOptions.STANDARDBASELINE;
+        o.matte = MatteType.NONE;
+        doc.saveAs(f, o, true, Extension.LOWERCASE);
+    } catch(e1) {
+        safeLog("saveAs JPEG failed: " + e1);
+        // 2) fallback SaveForWeb
+        try {
+            var sfw = new ExportOptionsSaveForWeb();
+            sfw.format = SaveDocumentType.JPEG;
+            sfw.includeProfile = false;
+            sfw.interlaced = false;
+            sfw.optimized = true;
+            sfw.quality = Math.min(100, quality * 8);
+            doc.exportDocument(f, ExportType.SAVEFORWEB, sfw);
+        } catch(e2) {
+            throw new Error("Save failed both methods: " + e2);
+        }
+    }
+}
+
+function isSmartObjectLayer(ly) { try { return ly.kind == LayerKind.SMARTOBJECT; } catch(e) { return false; } }
+function isTextLayer(ly)       { try { return (ly.typename === "ArtLayer" && ly.kind === LayerKind.TEXT); } catch(e){ return false; } }
+
+function findFirstTextRec(container) {
+    for (var i=0; i<container.layers.length; i++) {
+        var ly = container.layers[i];
+        if (ly.typename === "LayerSet") {
+            var hit = findFirstTextRec(ly);
+            if (hit) return hit;
+        } else if (isTextLayer(ly)) {
+            return ly;
+        }
+    }
+    return null;
+}
+function getTextLayerFast(doc, name) {
+    if (!name) return null;
+    try { return doc.artLayers.getByName(name); } catch(e) {}
+    try {
+        var grp = doc.layerSets.getByName(name);
+        for (var i=0;i<grp.layers.length;i++) {
+            var ly = grp.layers[i];
+            if (isTextLayer(ly)) return ly;
+            if (ly.typename === "LayerSet") {
+                var ly2 = findFirstTextRec(ly);
+                if (ly2) return ly2;
+            }
+        }
+    } catch(e) {}
+    return null;
+}
+function enableUnicodeComposerIfSupported(textItem) {
+    try {
+        if (typeof TextComposer !== "undefined" && textItem) {
             if ("ADOBEEASTASIAN" in TextComposer) textItem.textComposer = TextComposer.ADOBEEASTASIAN;
             else if ("ADOBESINGLELINEEASTASIAN" in TextComposer) textItem.textComposer = TextComposer.ADOBESINGLELINEEASTASIAN;
             else if ("ADOBEEVERYLINEEASTASIAN" in TextComposer) textItem.textComposer = TextComposer.ADOBEEVERYLINEEASTASIAN;
-        }}
-        try {{ textItem.useAutoKern = true; }} catch(e) {{}}
-    }} catch(e) {{}}
-}}
-
-// ---- Fast path theo tên layer + fallback đệ quy ----
-function findFirstTextRec(container) {{
-    for (var i=0; i<container.layers.length; i++) {{
-        var ly = container.layers[i];
-        if (ly.typename === "LayerSet") {{
-            var hit = findFirstTextRec(ly);
-            if (hit) return hit;
-        }} else if (isTextLayer(ly)) {{
-            return ly;
-        }}
-    }}
-    return null;
-}}
-function getTextLayerFast(doc, name) {{
-    if (!name) return null;
-    // thử trực tiếp ở root
-    try {{ return doc.artLayers.getByName(name); }} catch(e) {{}}
-    // thử group cùng tên (1 cấp), rồi tìm text layer đầu tiên bên trong
-    try {{
-        var grp = doc.layerSets.getByName(name);
-        for (var i=0;i<grp.layers.length;i++) {{
-            var ly = grp.layers[i];
-            if (isTextLayer(ly)) return ly;
-            if (ly.typename === "LayerSet") {{
-                var ly2 = findFirstTextRec(ly);
-                if (ly2) return ly2;
-            }}
-        }}
-    }} catch(e) {{}}
-    return null;
-}}
-function setTextFastOrFirst(doc, newText) {{
+        }
+        try { textItem.useAutoKern = true; } catch(e) {}
+    } catch(e) {}
+}
+function setTextFastOrFirst(doc, newText) {
     var target = getTextLayerFast(doc, textLayerName);
-    if (!target) {{
-        target = findFirstTextRec(doc);
-    }}
+    if (!target) target = findFirstTextRec(doc);
     if (!target) return false;
-    try {{ if (target.allLocked) target.allLocked = false; }} catch(e) {{}}
-    try {{
+    try { if (target.allLocked) target.allLocked = false; } catch(e) {}
+    try {
         enableUnicodeComposerIfSupported(target.textItem);
         target.visible = true;
         target.textItem.contents = newText;
         return true;
-    }} catch(e) {{ return false; }}
-}}
+    } catch(e) { return false; }
+}
 
-function basenameNoExt(p) {{
+function rasterizeActiveLayer() {
+    try {
+        var idRst = stringIDToTypeID("rasterizeLayer");
+        var desc2 = new ActionDescriptor();
+        var ref = new ActionReference();
+        ref.putEnumerated(charIDToTypeID("Lyr "), charIDToTypeID("Ordn"), charIDToTypeID("Trgt"));
+        desc2.putReference(charIDToTypeID("null"), ref);
+        executeAction(idRst, desc2, DialogModes.NO);
+        return true;
+    } catch(e) { safeLog("Rasterize failed: " + e); return false; }
+}
+
+function walkAndRelinkFirstSO(container, newFile) {
+    for (var i=0; i<container.layers.length; i++) {
+        var ly = container.layers[i];
+        if (ly.typename === "LayerSet") {
+            var ok = walkAndRelinkFirstSO(ly, newFile);
+            if (ok) return true;
+        } else {
+            if (isSmartObjectLayer(ly)) {
+                app.activeDocument.activeLayer = ly;
+                try {
+                    var idplacedLayerReplaceContents = stringIDToTypeID("placedLayerReplaceContents");
+                    var desc = new ActionDescriptor();
+                    desc.putPath(charIDToTypeID("null"), new File(newFile));
+                    executeAction(idplacedLayerReplaceContents, desc, DialogModes.NO);
+                } catch (e) {
+                    safeLog("ReplaceContents failed → rasterizing: " + e);
+                    rasterizeActiveLayer();
+                }
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+function basenameNoExt(p) {
     var f = new File(p);
     var n = f.name;
     var dot = n.lastIndexOf(".");
     if (dot > 0) return n.substring(0, dot);
     return n;
-}}
+}
 
-function ensureParentFolder(pathStr) {{
-    try {{
-        var f = new File(pathStr);
-        var folder = f.parent;
-        if (!folder.exists) folder.create();
-    }} catch (e) {{}}
-}}
-
-function normalizeForRaster(doc) {{
-    try {{
-        if (doc.bitsPerChannel && doc.bitsPerChannel == BitsPerChannelType.THIRTYTWO) {{
-            doc.bitsPerChannel = BitsPerChannelType.EIGHT;
-        }}
-    }} catch (e) {{}}
-    try {{
-        if (doc.mode != DocumentMode.RGB && doc.mode != DocumentMode.GRAYSCALE && doc.mode != DocumentMode.INDEXEDCOLOR) {{
-            doc.changeMode(ChangeMode.RGB);
-        }}
-    }} catch (e) {{}}
-}}
-
-function saveJPEG_HQ(doc, outPath, quality) {{
-    ensureParentFolder(outPath);
-    normalizeForRaster(doc);
-    try {{ doc.flatten(); }} catch (e) {{}}
-
-    var f = new File(outPath);
-    var opts = new JPEGSaveOptions();
-    opts.quality = quality; // 0–12
-    opts.embedColorProfile = true;
-    opts.formatOptions = FormatOptions.STANDARDBASELINE;
-    opts.matte = MatteType.NONE;
-    doc.saveAs(f, opts, true, Extension.LOWERCASE);
-}}
-
-function writeFlag(p, txt) {{
-    try {{
-        var fl = new File(p);
-        fl.encoding = "UTF8";
-        fl.open("w");
-        fl.write(txt);
-        fl.close();
-    }} catch(e) {{}}
-}}
-
-// ----------------- MAIN (suspendHistory trên Document) -----------------
-
-// Thao tác chính, dùng activeDocument trong thân để tương thích suspendHistory
-function _main() {{
+// ----------------- MAIN -----------------
+function _main() {
     var doc = app.activeDocument;
-
     var ok = walkAndRelinkFirstSO(doc, imgPath);
-    if (!ok) {{
-        doc.close(SaveOptions.DONOTSAVECHANGES);
-        throw new Error("No Smart Object layer found to relink.");
-    }}
+    if (!ok) throw new Error("Không tìm thấy Smart Object layer để relink.");
 
     var outName = basenameNoExt(outPath);
-    try {{ outName = decodeURIComponent(outName); }} catch(e) {{}}
+    try { outName = decodeURIComponent(outName); } catch(e) {}
     setTextFastOrFirst(doc, outName);
 
     var dup = doc.duplicate();
     saveJPEG_HQ(dup, outPath, JPEG_QUALITY);
-
     dup.close(SaveOptions.DONOTSAVECHANGES);
     doc.close(SaveOptions.DONOTSAVECHANGES);
-}}
+}
 
-try {{
+try {
     var psdFile = new File(psdPath);
     if (!psdFile.exists) throw new Error("PSD not found: " + psdPath);
 
-    // Mở document trước…
     var doc = app.open(psdFile);
-
-    // …rồi gói thao tác vào doc.suspendHistory nếu có, không thì fallback
-    try {{
-        if (doc && doc.suspendHistory) {{
-            doc.suspendHistory("BatchRelinkExport", "_main()");
-        }} else {{
-            _main();
-        }}
-    }} catch (e2) {{
-        _main();
-    }}
+    try {
+        if (doc && doc.suspendHistory) doc.suspendHistory("BatchRelinkExport", "_main()");
+        else _main();
+    } catch (e2) { _main(); }
 
     writeFlag(okFlag, "OK");
-}} catch(e) {{
+} catch(e) {
     writeFlag(errFlag, e.toString());
     throw e;
-}}
+}
 """
+
 
 
 DEFAULT_PS_EXE = [
@@ -311,13 +326,13 @@ class _PhotoshopBridge:
         os.makedirs(os.path.dirname(out_abs), exist_ok=True)
 
         text_layer_name = (TEXT_LAYER_NAME or "").replace('"', '\\"')
-        jsx_code = JSX_TEMPLATE.format(
-            psd=psd_abs,
-            img=img_abs,
-            out=out_abs,
-            jpeg_quality=JPEG_QUALITY,
-            text_layer=text_layer_name
-        )
+        jsx_code = _render_curly(JSX_TEMPLATE, {
+            "psd": psd_abs,
+            "img": img_abs,
+            "out": out_abs,
+            "jpeg_quality": JPEG_QUALITY,
+            "text_layer": text_layer_name,
+        })
 
         if self.mode == "com":
             try:

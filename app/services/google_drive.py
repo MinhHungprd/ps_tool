@@ -4,6 +4,7 @@ from google.auth.transport.requests import Request
 import os
 import io
 import requests
+import re
 from app.config import CREDENTIALS_FILE, SCOPES
 
 def get_drive_service():
@@ -21,18 +22,44 @@ def get_drive_service():
     return build('drive', 'v3', credentials=creds)
 
 def download_from_share_link(link):
-    # Ví dụ: https://drive.google.com/file/d/FILE_ID/view?usp=sharing -> Tải bằng requests
+    # Trích xuất file_id từ link chia sẻ
     file_id = link.split('/d/')[1].split('/')[0]
-    url = f"https://drive.google.com/uc?export=download&id={file_id}"
-    response = requests.get(url)
-    if response.status_code == 200:
+    base_url = "https://drive.google.com/uc"
+    params = {'export': 'download', 'id': file_id}
+    
+    session = requests.Session()
+    response = session.get(base_url, params=params, stream=True)
+    
+    # Kiểm tra nếu là tải trực tiếp (có Content-Disposition)
+    if 'Content-Disposition' in response.headers:
         return response.content
+    
+    # Nếu không, trích xuất action URL và confirm token từ HTML
+    text = response.text
+    
+    # Tìm action URL từ form
+    action_match = re.search(r'<form id="download-form" action="([^"]+)"', text)
+    if action_match:
+        base_url = action_match.group(1)
+    
+    # Tìm confirm token từ input
+    confirm_match = re.search(r'<input[^>]*name="confirm"[^>]*value="([^"]+)"', text)
+    token = confirm_match.group(1) if confirm_match else None
+    
+    # Kiểm tra cookie cho download_warning
+    if not token:
+        for key, value in response.cookies.items():
+            if key.startswith('download_warning'):
+                token = value
+                break
+    
+    if token:
+        params['confirm'] = token
+        response = session.get(base_url, params=params, stream=True)
+        
+        if 'Content-Disposition' in response.headers:
+            return response.content
+        else:
+            raise Exception("Lỗi tải file: Không thể tải sau khi xác nhận")
     else:
-        raise Exception("Lỗi tải file")
-
-def upload_to_drive(file_path, filename):
-    service = get_drive_service()
-    file_metadata = {'name': filename}
-    media = MediaFileUpload(file_path, mimetype='image/jpeg')
-    file = service.files().create(body=file_metadata, media_body=media, fields='id').execute()
-    return f"https://drive.google.com/file/d/{file.get('id')}/view"
+        raise Exception("Lỗi tải file: Không tìm thấy token xác nhận")
