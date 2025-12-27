@@ -1,0 +1,396 @@
+{% extends "base.html" %}
+{% set ambient = True %}
+{% block title %}Quản lý Template PSD{% endblock %}
+
+{% block content %}
+<h1 class="mb-4 fw-bold text-center">Quản lý Template PSD</h1>
+
+<!-- Toast/Alert container -->
+<div id="alert-container" style="position: fixed; top: 20px; right: 20px; z-index: 1070; min-width: 300px; max-height: 80vh; overflow-y: auto;"></div>
+
+<div class="row g-4 flex-column-reverse flex-lg-row">
+  <!-- Upload -->
+  <div class="col-12 col-lg-8 mx-auto">
+    <div class="card p-3 p-md-4">
+      <h5 class="card-title">Upload / Thay thế template</h5>
+      <form id="tpl-upload" enctype="multipart/form-data" class="mt-3">
+        <div class="row">
+          <div class="col-md-6 mb-3">
+            <label class="form-label">Loại áo</label>
+            <select id="type-select" class="form-select">
+              <option value="">(Chọn loại đã có)</option>
+            </select>
+            <div class="mt-2">
+              <input id="type-new" class="form-control" placeholder="Hoặc nhập loại áo mới" />
+            </div>
+            <div class="form-text">Nếu nhập ô bên dưới thì dùng tên mới; để trống sẽ dùng mục đã chọn.</div>
+          </div>
+
+          <div class="col-md-6 mb-3">
+            <label class="form-label">Size</label>
+            <select id="size-select" class="form-select">
+              <option value="S">S</option>
+              <option value="M" selected>M</option>
+              <option value="L">L</option>
+              <option value="XL">XL</option>
+              <option value="2XL">2XL</option>
+            </select>
+            <div class="mt-2">
+              <input id="size-new" class="form-control" placeholder="Hoặc nhập size khác" />
+            </div>
+            <div class="form-text">Nếu nhập ô bên dưới thì dùng size mới; để trống sẽ dùng mục đã chọn.</div>
+          </div>
+        </div>
+
+        <div class="mb-3">
+          <label class="form-label">Chọn file .psd</label>
+          <input type="file" name="file" accept=".psd" class="form-control" required />
+        </div>
+
+        <div class="form-check mb-3">
+          <input class="form-check-input" type="checkbox" id="overwrite" checked />
+          <label class="form-check-label" for="overwrite">Ghi đè nếu đã tồn tại</label>
+        </div>
+
+        <div class="d-grid">
+          <button type="submit" class="btn btn-primary">Upload</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- List -->
+  <div class="col-12">
+    <div class="card p-3 p-md-4">
+      <div class="d-flex justify-content-between align-items-center mb-3">
+        <h5 class="card-title m-0">Danh sách template</h5>
+        <button class="btn btn-sm btn-outline-primary" id="refreshBtn">Làm mới</button>
+      </div>
+
+      <div class="row g-2 mb-3">
+        <div class="col-md-6">
+          <input type="text" id="search-template" class="form-control" placeholder="Tìm loại áo hoặc size..." />
+        </div>
+        <div class="col-md-3">
+          <select id="filter-type" class="form-select"><option value="">Tất cả loại áo</option></select>
+        </div>
+        <div class="col-md-3">
+          <select id="filter-size" class="form-select">
+            <option value="">Tất cả size</option>
+            <option>S</option><option>M</option><option>L</option><option>XL</option><option>2XL</option>
+          </select>
+        </div>
+      </div>
+
+      <div id="tpl-tree">
+        <div class="text-center py-4">
+          <div class="spinner-border" role="status"><span class="visually-hidden">Đang tải...</span></div>
+          <p class="mt-2">Đang tải danh sách template...</p>
+        </div>
+      </div>
+
+      <nav aria-label="Pagination" class="mt-4">
+        <ul id="pagination" class="pagination justify-content-center"></ul>
+      </nav>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+/* ---------- Alert helper ---------- */
+function showAlert(message, type='info'){
+  const id = 'al-' + Date.now();
+  const colors = {success:'alert-success', warning:'alert-warning', error:'alert-danger', info:'alert-info'};
+  const el = `
+    <div id="${id}" class="alert ${colors[type]||colors.info} alert-dismissible fade show d-flex align-items-center mb-2 shadow">
+      <div class="me-2">•</div><div class="flex-grow-1">${message}</div>
+      <button type="button" class="btn-close" onclick="document.getElementById('${id}').remove()"></button>
+    </div>`;
+  const wrap = document.getElementById('alert-container');
+  wrap.insertAdjacentHTML('beforeend', el);
+  setTimeout(()=>document.getElementById(id)?.remove(), 4500);
+}
+
+/* ---------- Unicode/VN search helper ---------- */
+function vnKey(s){
+  return (s||'')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g,'')   // bỏ dấu
+    .toLowerCase();
+}
+
+/* ---------- Data & pagination ---------- */
+let allTemplates = [];   // [{type, sizes}|{type, entries:[{size, filename}]}]
+let currentPage = 1;
+const perPage = 6;
+
+function renderPagination(total){
+  const totalPages = Math.max(1, Math.ceil(total/perPage));
+  const ul = document.getElementById('pagination');
+  if (totalPages<=1){ ul.innerHTML=''; return; }
+  let html='';
+  if (currentPage>1) html += `<li class="page-item"><a class="page-link" href="#" onclick="return goPage(${currentPage-1})">&laquo;</a></li>`;
+  for(let i=1;i<=totalPages;i++){
+    html += `<li class="page-item ${i===currentPage?'active':''}"><a class="page-link" href="#" onclick="return goPage(${i})">${i}</a></li>`;
+  }
+  if (currentPage<totalPages) html += `<li class="page-item"><a class="page-link" href="#" onclick="return goPage(${currentPage+1})">&raquo;</a></li>`;
+  ul.innerHTML = html;
+}
+function goPage(p){ currentPage=p; renderList(filterData()); return false; }
+
+/* ---------- Fetch tree (hard no-cache + cache-bust) ---------- */
+async function fetchTree(){
+  document.getElementById('tpl-tree').innerHTML = `
+    <div class="text-center py-4">
+      <div class="spinner-border" role="status"></div>
+      <p class="mt-2">Đang tải danh sách template...</p>
+    </div>`;
+  const url = `{{ url_for('main.template_tree') }}?t=${Date.now()}`;
+  const res = await fetch(url, {
+    method: 'GET',
+    headers: {
+      'Cache-Control':'no-cache, no-store, must-revalidate',
+      'Pragma': 'no-cache'
+    }
+  });
+  if(!res.ok){
+    const err = await res.json().catch(()=>({error:'Lỗi tải dữ liệu'}));
+    showAlert(err.error||'Lỗi tải dữ liệu','error');
+    return;
+  }
+  const data = await res.json();
+  allTemplates = (data.items||[]).map(it => {
+    if (Array.isArray(it.entries)) {
+      return { type: it.type, sizes: it.entries.map(e=>e.size), entries: it.entries };
+    }
+    return { type: it.type, sizes: it.sizes || [] };
+  });
+  populateSelectors();
+  currentPage=1;
+  renderList(filterData());
+}
+
+/* ---------- Fill selects ---------- */
+function populateSelectors(){
+  const typeSel = document.getElementById('type-select');
+  const filterTypeSel = document.getElementById('filter-type');
+  const uniqTypes = Array.from(new Set(allTemplates.map(x=>x.type)));
+  typeSel.innerHTML = '<option value="">(Chọn loại đã có)</option>' + uniqTypes.map(t=>`<option>${t}</option>`).join('');
+  filterTypeSel.innerHTML = '<option value="">Tất cả loại áo</option>' + uniqTypes.map(t=>`<option>${t}</option>`).join('');
+}
+
+/* ---------- Filtering (accent-insensitive) ---------- */
+function filterData(){
+  const qRaw = document.getElementById('search-template').value.trim();
+  const q = vnKey(qRaw);
+  const ft = document.getElementById('filter-type').value;
+  const fs = document.getElementById('filter-size').value;
+
+  return allTemplates.map(t => ({
+    type: t.type,
+    entries: (t.entries ? t.entries : (t.sizes||[]).map(sz=>({size:sz, filename: null})))
+      .filter(e => (!fs || e.size===fs))
+  }))
+  .filter(t=>{
+    if (ft && t.type!==ft) return false;
+    if (q){
+      const hitType = vnKey(t.type).includes(q);
+      const hitSize = t.entries.some(e=> vnKey(e.size||'').includes(q));
+      if (!hitType && !hitSize) return false;
+    }
+    if (fs && t.entries.length===0) return false;
+    return true;
+  });
+}
+
+/* ---------- Render list (onclick an toàn với JSON.stringify) ---------- */
+function renderList(list){
+  const start = (currentPage-1)*perPage;
+  const pageItems = list.slice(start,start+perPage);
+  const host = document.getElementById('tpl-tree');
+
+  if(!pageItems.length){
+    host.innerHTML = `<div class="text-center py-5 text-muted">Không có template nào.</div>`;
+    renderPagination(0); return;
+  }
+
+  const html = pageItems.map(it=>{
+    const tJson = JSON.stringify(it.type);
+    const sizes = it.entries.length
+      ? it.entries.map(e => {
+          const fname = e.filename || `${it.type}_${e.size}.psd`;
+          const sJson = JSON.stringify(e.size);
+          return `
+            <li class="list-group-item d-flex justify-content-between align-items-center">
+              <div class="flex-grow-1 me-3">
+                <span class="badge bg-primary me-2">${e.size}</span><code>${fname}</code>
+              </div>
+              <div class="btn-group" role="group">
+                <button class="btn btn-sm btn-outline-secondary" onclick='return renameSize(${tJson}, ${sJson})'>Sửa tên size</button>
+                <button class="btn btn-sm btn-outline-danger" onclick='return deleteSize(${tJson}, ${sJson})'>Xóa</button>
+              </div>
+            </li>`;
+        }).join('')
+      : `<li class="list-group-item text-muted">Chưa có size</li>`;
+
+    return `
+      <div class="mb-3 border rounded-3 overflow-hidden">
+        <div class="d-flex justify-content-between align-items-center p-2 bg-light">
+          <h6 class="m-0 flex-grow-1">Loại: <code>${it.type}</code></h6>
+          <div class="btn-group" role="group">
+            <button class="btn btn-sm btn-outline-secondary" onclick='return renameType(${tJson})'>Sửa tên loại</button>
+            <button class="btn btn-sm btn-outline-danger" onclick='return deleteType(${tJson})'>Xóa cả loại</button>
+          </div>
+        </div>
+        <ul class="list-group list-group-flush">${sizes}</ul>
+      </div>`;
+  }).join('');
+
+  host.innerHTML = html;
+  renderPagination(list.length);
+}
+
+/* ---------- Helpers xác minh sau xóa ---------- */
+function existsType(typeName){
+  return allTemplates.some(x=>x.type===typeName);
+}
+function existsSize(typeName, sizeName){
+  const t = allTemplates.find(x=>x.type===typeName);
+  if (!t) return false;
+  const entries = t.entries ? t.entries.map(e=>e.size) : (t.sizes||[]);
+  return entries.includes(sizeName);
+}
+
+/* ---------- Delete actions ---------- */
+async function deleteType(typeName){
+  const ok = await showConfirm(`Xóa toàn bộ loại "<strong>${typeName}</strong>"?`, 'Xóa loại áo', 'Xóa');
+  if(!ok) return false;
+
+  const res = await fetch(`{{ url_for('main.template_delete') }}?type=${encodeURIComponent(typeName)}&t=${Date.now()}`, {
+    method:'DELETE',
+    headers:{ 'Cache-Control':'no-cache, no-store, must-revalidate','Pragma':'no-cache' }
+  });
+
+  await fetchTree();
+  if(res.ok && !existsType(typeName)){
+    showAlert(`Đã xóa loại áo "${typeName}"`,'success');
+  }else{
+    const e = await res.json().catch(()=>({error:'Xóa thất bại'}));
+    showAlert(e.error || 'Xóa thất bại (vẫn còn trong danh sách)','error');
+  }
+  return false;
+}
+
+async function deleteSize(typeName, sizeName){
+  const ok = await showConfirm(`Xóa template <strong>${typeName}</strong> size <strong>${sizeName}</strong>?`, 'Xóa template', 'Xóa');
+  if(!ok) return false;
+
+  const res = await fetch(`{{ url_for('main.template_delete') }}?type=${encodeURIComponent(typeName)}&size=${encodeURIComponent(sizeName)}&t=${Date.now()}`, {
+    method:'DELETE',
+    headers:{ 'Cache-Control':'no-cache, no-store, must-revalidate','Pragma':'no-cache' }
+  });
+
+  await fetchTree();
+  if(res.ok && !existsSize(typeName, sizeName)){
+    showAlert(`Đã xóa ${typeName}/${sizeName}`,'success');
+  }else{
+    const e = await res.json().catch(()=>({error:'Xóa thất bại'}));
+    showAlert(e.error || 'Xóa thất bại (vẫn còn trong danh sách)','error');
+  }
+  return false;
+}
+
+/* ---------- Rename actions (type / size) ---------- */
+async function renameType(typeName){
+  const newName = prompt(`Nhập tên loại mới cho "${typeName}":`, typeName);
+  if (!newName || newName.trim()===typeName) return false;
+
+  const res = await fetch(`{{ url_for('main.template_rename') }}`, {
+    method: 'PATCH',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({ type: typeName, new_type: newName.trim() })
+  });
+
+  await fetchTree();
+  if(res.ok && existsType(newName.trim()) && !existsType(typeName)){
+    showAlert(`Đã đổi tên loại: <code>${typeName}</code> → <code>${newName.trim()}</code>`,'success');
+  }else{
+    const e = await res.json().catch(()=>({error:'Đổi tên thất bại'}));
+    showAlert(e.error || 'Đổi tên thất bại','error');
+  }
+  return false;
+}
+
+async function renameSize(typeName, sizeName){
+  const newSize = prompt(`Nhập size mới cho ${typeName}/${sizeName}:`, sizeName);
+  if (!newSize || newSize.trim()===sizeName) return false;
+
+  const res = await fetch(`{{ url_for('main.template_rename') }}`, {
+    method: 'PATCH',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({ type: typeName, size: sizeName, new_size: newSize.trim() })
+  });
+
+  await fetchTree();
+  if(res.ok && existsSize(typeName, newSize.trim()) && !existsSize(typeName, sizeName)){
+    showAlert(`Đã đổi size: <code>${typeName}/${sizeName}</code> → <code>${typeName}/${newSize.trim()}</code>`,'success');
+  }else{
+    const e = await res.json().catch(()=>({error:'Đổi size thất bại'}));
+    showAlert(e.error || 'Đổi size thất bại','error');
+  }
+  return false;
+}
+
+/* ---------- Upload ---------- */
+document.getElementById('tpl-upload').addEventListener('submit', async (e)=>{
+  e.preventDefault();
+
+  const type = (document.getElementById('type-new').value.trim() || document.getElementById('type-select').value.trim());
+  if(!type){ showAlert('Vui lòng nhập hoặc chọn loại áo','warning'); return; }
+
+  const size = (document.getElementById('size-new').value.trim() || document.getElementById('size-select').value.trim() || 'M');
+
+  const file = e.target.querySelector('input[type="file"]').files[0];
+  if(!file){ showAlert('Vui lòng chọn file PSD','warning'); return; }
+
+  const fd = new FormData();
+  fd.set('type', type);
+  fd.set('size', size);
+  fd.set('overwrite', document.getElementById('overwrite').checked ? 'true':'false');
+  fd.set('file', file);
+
+  const btn = e.target.querySelector('button[type="submit"]');
+  const txt = btn.innerHTML; btn.innerHTML = 'Đang upload...'; btn.disabled = true;
+
+  try{
+    const res = await fetch(`{{ url_for('main.template_upload') }}`, { method:'POST', body: fd });
+    const payload = await res.json().catch(()=>null);
+    if(!res.ok) throw new Error(payload?.error || 'Upload thất bại');
+    showAlert(`Đã lưu: <code>${payload.type}/${payload.size}/${payload.filename || (payload.type + '_' + payload.size + '.psd')}</code>`,'success');
+    e.target.reset();
+    await fetchTree();
+  }catch(err){
+    showAlert(err.message,'error');
+  }finally{
+    btn.innerHTML = txt; btn.disabled = false;
+  }
+});
+
+/* ---------- Filters ---------- */
+function setupFilters(){
+  const search = document.getElementById('search-template');
+  const fType  = document.getElementById('filter-type');
+  const fSize  = document.getElementById('filter-size');
+  const onChange = ()=>{ currentPage=1; renderList(filterData()); };
+  search.addEventListener('input', onChange);
+  fType.addEventListener('change', onChange);
+  fSize.addEventListener('change', onChange);
+}
+
+/* ---------- Init ---------- */
+document.getElementById('refreshBtn').addEventListener('click', fetchTree);
+document.addEventListener('DOMContentLoaded', ()=>{ setupFilters(); fetchTree(); });
+</script>
+{% endblock %}
